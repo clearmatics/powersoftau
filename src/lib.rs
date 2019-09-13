@@ -35,6 +35,7 @@ extern crate generic_array;
 extern crate typenum;
 extern crate byteorder;
 extern crate bincode;
+extern crate rustc_serialize;
 
 use byteorder::{ReadBytesExt, BigEndian};
 use rand::{SeedableRng, Rng};
@@ -42,6 +43,7 @@ use rand::chacha::ChaChaRng;
 use bn::*;
 use std::ops::*;
 use bincode::{DecodingError, EncodingError};
+use rustc_serialize::{Decodable, Encodable};
 
 const INF : bincode::SizeLimit = bincode::SizeLimit::Infinite;
 
@@ -94,13 +96,13 @@ fn hash_to_g2(mut digest: &[u8]) -> G2
 {
     assert!(digest.len() >= 32);
 
-    let mut seed = Vec::with_capacity(8);
-
-    for _ in 0..8 {
-        seed.push(digest.read_u32::<BigEndian>().expect("assertion above guarantees this to work"));
+    let mut seed : [u8;32] = [0;32];
+    for i in 0..8 {
+        let bytes = digest.read_u32::<BigEndian>().unwrap().to_be_bytes();
+        seed[(4 * i) .. ((4 * i) + 4)].copy_from_slice(&bytes);
     }
 
-    G2::random(&mut ChaChaRng::from_seed(&seed))
+    G2::random(&mut ChaChaRng::from_seed(seed))
 }
 
 #[test]
@@ -229,7 +231,8 @@ fn write_point<W, G>(
     _compression: UseCompression
 ) -> io::Result<()>
     where W: Write,
-          G: Group
+          G: Group,
+          G: Encodable
 {
     // TODO: Support exporting to compressed format
 
@@ -295,7 +298,7 @@ impl PublicKey {
     /// points at infinity.
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<PublicKey, DeserializationError>
     {
-        fn read_uncompressed<C: Group, R: Read>(reader: &mut R) -> Result<C, DeserializationError> {
+        fn read_uncompressed<C: Group + Decodable, R: Read>(reader: &mut R) -> Result<C, DeserializationError> {
             let v : C = bincode::decode_from(reader, INF)?;
 
             if v.is_zero() {
@@ -383,7 +386,7 @@ impl Accumulator {
         compression: UseCompression
     ) -> io::Result<()>
     {
-        fn write_all<W: Write, C: Group>(
+        fn write_all<W: Write, C: Group + Encodable>(
             writer: &mut W,
             c: &[C],
             compression: UseCompression
@@ -414,14 +417,14 @@ impl Accumulator {
         checked: CheckForCorrectness
     ) -> Result<Self, DeserializationError>
     {
-        fn read_all<R: Read, C: Group>(
+        fn read_all<R: Read, C: Group + Decodable>(
             reader: &mut R,
             size: usize,
             _compression: UseCompression,
             checked: CheckForCorrectness
         ) -> Result<Vec<C>, DecodingError>
         {
-            fn decompress_all<R: Read, C: Group>(
+            fn decompress_all<R: Read, C: Group + Decodable>(
                 reader: &mut R,
                 size: usize,
                 _checked: CheckForCorrectness
