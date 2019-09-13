@@ -466,33 +466,51 @@ impl Accumulator {
     pub fn transform(&mut self, key: &PrivateKey)
     {
         // Construct the powers of tau
+        let mut taupowers = vec![Fr::zero(); TAU_POWERS_G1_LENGTH];
+        let chunk_size = TAU_POWERS_G1_LENGTH / num_cpus::get();
 
-        /// Exponentiate a large number of points, with an optional
-        /// coefficient to be applied to the exponent.
-        fn batch_exp<C: Group>(bases: &mut [C], tau: &Fr, coeff: Option<&Fr>)
+        crossbeam::scope(|scope| {
+            for (i, taupowers) in taupowers.chunks_mut(chunk_size).enumerate() {
+                scope.spawn(move || {
+                    let exp : U256 = U256::from((i * chunk_size) as u64);
+                    let exp = Fr::new(exp).unwrap();
+                    let mut acc = key.tau.pow(exp);
+                    for t in taupowers {
+                        *t = acc;
+                        acc = acc * key.tau;
+                    }
+                });
+            }
+        });
+
+        fn batch_exp<C: Group>(bases: &mut [C], exp: &[Fr], coeff: Option<&Fr>)
         {
-            // TODO: Restore the wNAF approach for (coeff) \tau^i
+            assert_eq!(bases.len(), exp.len());
+            let chunk_size = bases.len() / num_cpus::get();
 
-            // TODO: The naive approach may be too slow even for a PoC.  May
-            // need to refactor before wNAF.
-
-            let mut tau_power = Fr::one();
-            if let Some(coeff) = coeff {
-                tau_power = tau_power.mul(*coeff);
-            }
-
-            bases[0] = bases[0].mul(tau_power);
-
-            for i in 1..bases.len() {
-                tau_power = tau_power.mul(*tau);
-                bases[i] = bases[i].mul(tau_power);
-            }
+            // Perform exponentiation over multiple cores.
+            crossbeam::scope(|scope| {
+                for (bases, exp) in bases.chunks_mut(chunk_size)
+                    .zip(exp.chunks(chunk_size))
+                {
+                    scope.spawn(move || {
+                        for (base, exp) in bases.iter_mut().zip(exp.iter())
+                        {
+                            let final_exp = {
+                                if let Some(coeff) = coeff { exp.mul(*coeff) }
+                                else { *exp }
+                            };
+                            *base = base.mul(final_exp);
+                        }
+                    });
+                }
+            });
         }
 
-        batch_exp(&mut self.tau_powers_g1, &key.tau, None);
-        batch_exp(&mut self.tau_powers_g2, &key.tau, None);
-        batch_exp(&mut self.alpha_tau_powers_g1, &key.tau, Some(&key.alpha));
-        batch_exp(&mut self.beta_tau_powers_g1, &key.tau, Some(&key.beta));
+        batch_exp(&mut self.tau_powers_g1, &taupowers[0..], None);
+        batch_exp(&mut self.tau_powers_g2, &taupowers[0..TAU_POWERS_LENGTH], None);
+        batch_exp(&mut self.alpha_tau_powers_g1, &taupowers[0..TAU_POWERS_LENGTH], Some(&key.alpha));
+        batch_exp(&mut self.beta_tau_powers_g1, &taupowers[0..TAU_POWERS_LENGTH], Some(&key.beta));
         self.beta_g2 = self.beta_g2.mul(key.beta);
     }
 }
