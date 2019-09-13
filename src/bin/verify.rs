@@ -6,7 +6,6 @@ extern crate byteorder;
 
 use powersoftau::*;
 use powersoftau::cmd_utils::*;
-
 use std::str;
 use std::fs::OpenOptions;
 use std::io::{self, BufReader, Write, Read};
@@ -187,7 +186,6 @@ fn main() {
         println!("Digest not found!");
         std::process::exit(1);
     }
-
     if skip_lagrange {
         println!("WARNING: --skip-lagrange flag unused");
     }

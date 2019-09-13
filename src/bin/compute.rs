@@ -50,13 +50,13 @@ fn main() {
 
         let mut digest = &h[..];
 
-        // Interpret the first 32 bytes of the digest as 8 32-bit words
-        let mut seed = [0u32; 8];
+        let mut seed : [u8;32] = [0;32];
         for i in 0..8 {
-            seed[i] = digest.read_u32::<BigEndian>().expect("digest is large enough for this to work");
+            let bytes = digest.read_u32::<BigEndian>().unwrap().to_be_bytes();
+            seed[(4 * i) .. ((4 * i) + 4)].copy_from_slice(&bytes);
         }
 
-        ChaChaRng::from_seed(&seed)
+        ChaChaRng::from_seed(seed)
     };
 
     // Try to load `./challenge` from disk.
@@ -86,7 +86,7 @@ fn main() {
 
     let writer = BufWriter::new(writer);
     let mut writer = HashWriter::new(writer);
-    
+
     println!("Reading `./challenge` into memory...");
 
     // Read the BLAKE2b hash of the previous contribution
@@ -104,7 +104,7 @@ fn main() {
         UseCompression::No,
         CheckForCorrectness::No)
         .expect("unable to read uncompressed accumulator");
-    
+
     // Get the hash of the current accumulator
     let current_accumulator_hash = reader.into_hash();
 

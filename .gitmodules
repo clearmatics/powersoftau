@@ -1,0 +1,3 @@
+[submodule "depends/bn"]
+	path = depends/bn
+	url = https://github.com/clearmatics/bn

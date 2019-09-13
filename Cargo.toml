@@ -10,16 +10,17 @@ homepage = "https://github.com/ebfull/powersoftau"
 repository = "https://github.com/ebfull/powersoftau"
 
 [dependencies]
-rand = "0.4"
+rand = { version = "0.5", features = ["i128_support"] }
 crossbeam = "0.3.0"
 num_cpus = "1.7.0"
 blake2 = "0.6.1"
 generic-array = "0.8.3"
 typenum = "1.9.0"
-byteorder = "1.1.0"
+byteorder = { version = "1.0", features = ["i128"] }
 hex-literal = "0.1"
 rust-crypto = "0.2"
-getopts = "0.2.21"
+bn = { path="depends/bn" }
+rustc-serialize = { version = "0.3" }
+bincode = "0.1.2"
 hex = "0.3.1"
-bn = "0.4.3"
-bincode = "0.1"
+getopts = "0.2.21"

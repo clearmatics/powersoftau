@@ -1,10 +1,10 @@
 extern crate getopts;
 
-// This ceremony is based on the BLS12-381 elliptic curve construction.
+// This ceremony is based on the BN256 elliptic curve construction.
 pub const G1_UNCOMPRESSED_BYTE_SIZE: usize = 1 + 32 + 32;
 pub const G2_UNCOMPRESSED_BYTE_SIZE: usize = 1 + 64 + 64;
-pub const G1_COMPRESSED_BYTE_SIZE: usize = 1 + 32 + 32;
-pub const G2_COMPRESSED_BYTE_SIZE: usize = 1 + 64 + 64;
+pub const G1_COMPRESSED_BYTE_SIZE: usize = 1 + 32;
+pub const G2_COMPRESSED_BYTE_SIZE: usize = 1 + 64;
 
 pub const DEFAULT_NUM_POWERS: usize = (1 << 21);
 

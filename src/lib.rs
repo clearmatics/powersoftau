@@ -35,13 +35,16 @@ extern crate generic_array;
 extern crate typenum;
 extern crate byteorder;
 extern crate bincode;
+extern crate rustc_serialize;
 
+use arith::{U256};
 use byteorder::{ReadBytesExt, BigEndian};
 use rand::{SeedableRng, Rng};
 use rand::chacha::ChaChaRng;
 use bn::*;
 use std::ops::*;
 use bincode::{DecodingError, EncodingError};
+use rustc_serialize::{Decodable, Encodable};
 
 const INF : bincode::SizeLimit = bincode::SizeLimit::Infinite;
 
@@ -61,13 +64,13 @@ fn hash_to_g2(mut digest: &[u8]) -> G2
 {
     assert!(digest.len() >= 32);
 
-    let mut seed = Vec::with_capacity(8);
-
-    for _ in 0..8 {
-        seed.push(digest.read_u32::<BigEndian>().expect("assertion above guarantees this to work"));
+    let mut seed : [u8;32] = [0;32];
+    for i in 0..8 {
+        let bytes = digest.read_u32::<BigEndian>().unwrap().to_be_bytes();
+        seed[(4 * i) .. ((4 * i) + 4)].copy_from_slice(&bytes);
     }
 
-    G2::random(&mut ChaChaRng::from_seed(&seed))
+    G2::random(&mut ChaChaRng::from_seed(seed))
 }
 
 #[test]
@@ -193,14 +196,21 @@ pub enum CheckForCorrectness {
 fn write_point<W, G>(
     writer: &mut W,
     p: &G,
-    _compression: UseCompression
+    compression: UseCompression
 ) -> io::Result<()>
     where W: Write,
-          G: Group
+          G: Group,
+          G: Encodable,
+          G::Compressed: Encodable,
 {
-    // TODO: Support exporting to compressed format
+    let result = match compression {
+        UseCompression::No =>
+            bincode::encode_into(p, writer, INF),
+        UseCompression::Yes =>
+            bincode::encode_into(&p.as_compressed(), writer, INF),
+    };
 
-    match bincode::encode_into(p, writer, INF) {
+    match result {
         Err(EncodingError::IoError(io_err)) => Err(io_err),
         Err(EncodingError::SizeLimit) => Err(io::ErrorKind::Other)?,
         Ok(()) => Ok(()),
@@ -212,6 +222,7 @@ fn write_point<W, G>(
 pub enum DeserializationError {
     IoError(io::Error),
     DecodingError(DecodingError),
+    CurveError(CurveError),
     PointAtInfinity
 }
 
@@ -220,6 +231,7 @@ impl fmt::Display for DeserializationError {
         match *self {
             DeserializationError::IoError(ref e) => write!(f, "Disk IO error: {}", e),
             DeserializationError::DecodingError(ref e) => write!(f, "Decoding error: {}", e),
+            DeserializationError::CurveError(ref e) => write!(f, "Curve error: {:?}", e),
             DeserializationError::PointAtInfinity => write!(f, "Point at infinity found")
         }
     }
@@ -228,6 +240,12 @@ impl fmt::Display for DeserializationError {
 impl From<io::Error> for DeserializationError {
     fn from(err: io::Error) -> DeserializationError {
         DeserializationError::IoError(err)
+    }
+}
+
+impl From<CurveError> for DeserializationError {
+    fn from(err: CurveError) -> DeserializationError {
+        DeserializationError::CurveError(err)
     }
 }
 
@@ -262,7 +280,7 @@ impl PublicKey {
     /// points at infinity.
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<PublicKey, DeserializationError>
     {
-        fn read_uncompressed<C: Group, R: Read>(reader: &mut R) -> Result<C, DeserializationError> {
+        fn read_uncompressed<C: Group + Decodable, R: Read>(reader: &mut R) -> Result<C, DeserializationError> {
             let v : C = bincode::decode_from(reader, INF)?;
 
             if v.is_zero() {
@@ -352,11 +370,12 @@ impl Accumulator {
         compression: UseCompression
     ) -> io::Result<()>
     {
-        fn write_all<W: Write, C: Group>(
+        fn write_all<W: Write, C: Group + Encodable>(
             writer: &mut W,
             c: &[C],
-            compression: UseCompression
-        ) -> io::Result<()>
+            compression: UseCompression)
+            -> io::Result<()>
+            where C::Compressed: Encodable
         {
             for c in c {
                 write_point(writer, c, compression)?;
@@ -384,34 +403,45 @@ impl Accumulator {
         checked: CheckForCorrectness
     ) -> Result<Self, DeserializationError>
     {
-        fn read_all<R: Read, C: Group>(
+        fn read_all<R: Read, C: Group + Decodable>(
             reader: &mut R,
             size: usize,
-            _compression: UseCompression,
+            compression: UseCompression,
             checked: CheckForCorrectness
-        ) -> Result<Vec<C>, DecodingError>
+        ) -> Result<Vec<C>, DeserializationError>
+        where C::Compressed : Decodable
         {
-            fn decompress_all<R: Read, C: Group>(
+            fn decompress_all<R: Read, C: Group + Decodable>(
                 reader: &mut R,
                 size: usize,
+                compression: UseCompression,
                 _checked: CheckForCorrectness
-            ) -> Result<Vec<C>, DecodingError>
+            ) -> Result<Vec<C>, DeserializationError>
+                where C::Compressed : Decodable
             {
-                // TODO: Support skipping correctness checking
-
-                // TODO: Support reading compressed points
-
                 // Read the encoded elements
                 let mut elements = vec![C::zero(); size];
 
-                for element in &mut elements {
-                    *element = bincode::decode_from(reader, INF)?;
+                match compression {
+                    UseCompression::No => {
+                        for element in &mut elements {
+                            *element = bincode::decode_from(reader, INF)?;
+                        }
+                    }
+                    UseCompression::Yes => {
+                        for element in &mut elements {
+                            let comp : C::Compressed = bincode::decode_from(reader, INF)?;
+                            *element = C::from_compressed(&comp)?
+                        }
+                    }
                 }
+
+                // TODO: Support skipping correctness checking
 
                 Ok(elements)
             }
 
-            decompress_all::<_, C>(reader, size, checked)
+            decompress_all::<_, C>(reader, size, compression, checked)
         }
 
         let tau_powers_g1 = read_all(
@@ -438,33 +468,52 @@ impl Accumulator {
     pub fn transform(&mut self, key: &PrivateKey)
     {
         // Construct the powers of tau
+        let mut taupowers = vec![Fr::zero(); self.config.num_powers_g1];
+        let chunk_size = self.config.num_powers_g1 / num_cpus::get();
 
-        /// Exponentiate a large number of points, with an optional
-        /// coefficient to be applied to the exponent.
-        fn batch_exp<C: Group>(bases: &mut [C], tau: &Fr, coeff: Option<&Fr>)
+        crossbeam::scope(|scope| {
+            for (i, taupowers) in taupowers.chunks_mut(chunk_size).enumerate() {
+                scope.spawn(move || {
+                    let exp : U256 = U256::from((i * chunk_size) as u64);
+                    let exp = Fr::new(exp).unwrap();
+                    let mut acc = key.tau.pow(exp);
+                    for t in taupowers {
+                        *t = acc;
+                        acc = acc * key.tau;
+                    }
+                });
+            }
+        });
+
+        fn batch_exp<C: Group>(bases: &mut [C], exp: &[Fr], coeff: Option<&Fr>)
         {
-            // TODO: Restore the wNAF approach for (coeff) \tau^i
+            assert_eq!(bases.len(), exp.len());
+            let chunk_size = bases.len() / num_cpus::get();
 
-            // TODO: The naive approach may be too slow even for a PoC.  May
-            // need to refactor before wNAF.
-
-            let mut tau_power = Fr::one();
-            if let Some(coeff) = coeff {
-                tau_power = tau_power.mul(*coeff);
-            }
-
-            bases[0] = bases[0].mul(tau_power);
-
-            for i in 1..bases.len() {
-                tau_power = tau_power.mul(*tau);
-                bases[i] = bases[i].mul(tau_power);
-            }
+            // Perform exponentiation over multiple cores.
+            crossbeam::scope(|scope| {
+                for (bases, exp) in bases.chunks_mut(chunk_size)
+                    .zip(exp.chunks(chunk_size))
+                {
+                    scope.spawn(move || {
+                        for (base, exp) in bases.iter_mut().zip(exp.iter())
+                        {
+                            let final_exp = {
+                                if let Some(coeff) = coeff { exp.mul(*coeff) }
+                                else { *exp }
+                            };
+                            *base = base.mul(final_exp);
+                        }
+                    });
+                }
+            });
         }
 
-        batch_exp(&mut self.tau_powers_g1, &key.tau, None);
-        batch_exp(&mut self.tau_powers_g2, &key.tau, None);
-        batch_exp(&mut self.alpha_tau_powers_g1, &key.tau, Some(&key.alpha));
-        batch_exp(&mut self.beta_tau_powers_g1, &key.tau, Some(&key.beta));
+        let num_powers = self.config.num_powers;
+        batch_exp(&mut self.tau_powers_g1, &taupowers[0..], None);
+        batch_exp(&mut self.tau_powers_g2, &taupowers[0..num_powers], None);
+        batch_exp(&mut self.alpha_tau_powers_g1, &taupowers[0..num_powers], Some(&key.alpha));
+        batch_exp(&mut self.beta_tau_powers_g1, &taupowers[0..num_powers], Some(&key.beta));
         self.beta_g2 = self.beta_g2.mul(key.beta);
     }
 }

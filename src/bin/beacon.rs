@@ -54,12 +54,13 @@ fn main() {
 
         let mut digest = &cur_hash[..];
 
-        let mut seed = [0u32; 8];
+        let mut seed : [u8;32] = [0;32];
         for i in 0..8 {
-            seed[i] = digest.read_u32::<BigEndian>().expect("digest is large enough for this to work");
+            let bytes = digest.read_u32::<BigEndian>().unwrap().to_be_bytes();
+            seed[(4 * i) .. ((4 * i) + 4)].copy_from_slice(&bytes);
         }
 
-        ChaChaRng::from_seed(&seed)
+        ChaChaRng::from_seed(seed)
     };
 
     // Try to load `./challenge` from disk.
