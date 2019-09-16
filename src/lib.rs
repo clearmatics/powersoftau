@@ -37,6 +37,7 @@ extern crate byteorder;
 extern crate bincode;
 extern crate rustc_serialize;
 
+use arith::{U256};
 use byteorder::{ReadBytesExt, BigEndian};
 use rand::{SeedableRng, Rng};
 use rand::chacha::ChaChaRng;
@@ -56,8 +57,8 @@ use std::fmt;
 // This ceremony is based on the BN256 elliptic curve construction.
 const G1_UNCOMPRESSED_BYTE_SIZE: usize = 1 + 32 + 32;
 const G2_UNCOMPRESSED_BYTE_SIZE: usize = 1 + 64 + 64;
-const G1_COMPRESSED_BYTE_SIZE: usize = 1 + 32 + 32;
-const G2_COMPRESSED_BYTE_SIZE: usize = 1 + 64 + 64;
+const G1_COMPRESSED_BYTE_SIZE: usize = 1 + 32;
+const G2_COMPRESSED_BYTE_SIZE: usize = 1 + 64;
 
 /// The accumulator supports circuits with 2^21 multiplication gates.
 const TAU_POWERS_LENGTH: usize = (1 << 21);
@@ -228,15 +229,21 @@ pub enum CheckForCorrectness {
 fn write_point<W, G>(
     writer: &mut W,
     p: &G,
-    _compression: UseCompression
+    compression: UseCompression
 ) -> io::Result<()>
     where W: Write,
           G: Group,
-          G: Encodable
+          G: Encodable,
+          G::Compressed: Encodable,
 {
-    // TODO: Support exporting to compressed format
+    let result = match compression {
+        UseCompression::No =>
+            bincode::encode_into(p, writer, INF),
+        UseCompression::Yes =>
+            bincode::encode_into(&p.as_compressed(), writer, INF),
+    };
 
-    match bincode::encode_into(p, writer, INF) {
+    match result {
         Err(EncodingError::IoError(io_err)) => Err(io_err),
         Err(EncodingError::SizeLimit) => Err(io::ErrorKind::Other)?,
         Ok(()) => Ok(()),
@@ -248,6 +255,7 @@ fn write_point<W, G>(
 pub enum DeserializationError {
     IoError(io::Error),
     DecodingError(DecodingError),
+    CurveError(CurveError),
     PointAtInfinity
 }
 
@@ -256,6 +264,7 @@ impl fmt::Display for DeserializationError {
         match *self {
             DeserializationError::IoError(ref e) => write!(f, "Disk IO error: {}", e),
             DeserializationError::DecodingError(ref e) => write!(f, "Decoding error: {}", e),
+            DeserializationError::CurveError(ref e) => write!(f, "Curve error: {:?}", e),
             DeserializationError::PointAtInfinity => write!(f, "Point at infinity found")
         }
     }
@@ -264,6 +273,12 @@ impl fmt::Display for DeserializationError {
 impl From<io::Error> for DeserializationError {
     fn from(err: io::Error) -> DeserializationError {
         DeserializationError::IoError(err)
+    }
+}
+
+impl From<CurveError> for DeserializationError {
+    fn from(err: CurveError) -> DeserializationError {
+        DeserializationError::CurveError(err)
     }
 }
 
@@ -389,8 +404,9 @@ impl Accumulator {
         fn write_all<W: Write, C: Group + Encodable>(
             writer: &mut W,
             c: &[C],
-            compression: UseCompression
-        ) -> io::Result<()>
+            compression: UseCompression)
+            -> io::Result<()>
+            where C::Compressed: Encodable
         {
             for c in c {
                 write_point(writer, c, compression)?;
@@ -420,31 +436,42 @@ impl Accumulator {
         fn read_all<R: Read, C: Group + Decodable>(
             reader: &mut R,
             size: usize,
-            _compression: UseCompression,
+            compression: UseCompression,
             checked: CheckForCorrectness
-        ) -> Result<Vec<C>, DecodingError>
+        ) -> Result<Vec<C>, DeserializationError>
+        where C::Compressed : Decodable
         {
             fn decompress_all<R: Read, C: Group + Decodable>(
                 reader: &mut R,
                 size: usize,
+                compression: UseCompression,
                 _checked: CheckForCorrectness
-            ) -> Result<Vec<C>, DecodingError>
+            ) -> Result<Vec<C>, DeserializationError>
+                where C::Compressed : Decodable
             {
-                // TODO: Support skipping correctness checking
-
-                // TODO: Support reading compressed points
-
                 // Read the encoded elements
                 let mut elements = vec![C::zero(); size];
 
-                for element in &mut elements {
-                    *element = bincode::decode_from(reader, INF)?;
+                match compression {
+                    UseCompression::No => {
+                        for element in &mut elements {
+                            *element = bincode::decode_from(reader, INF)?;
+                        }
+                    }
+                    UseCompression::Yes => {
+                        for element in &mut elements {
+                            let comp : C::Compressed = bincode::decode_from(reader, INF)?;
+                            *element = C::from_compressed(&comp)?
+                        }
+                    }
                 }
+
+                // TODO: Support skipping correctness checking
 
                 Ok(elements)
             }
 
-            decompress_all::<_, C>(reader, size, checked)
+            decompress_all::<_, C>(reader, size, compression, checked)
         }
 
         let tau_powers_g1 = read_all(reader, TAU_POWERS_G1_LENGTH, compression, checked)?;
@@ -711,11 +738,26 @@ fn test_accumulator_serialization() {
     assert!(verify_transform(&before, &acc, &pk, &digest));
     digest[0] = !digest[0];
     assert!(!verify_transform(&before, &acc, &pk, &digest));
-    let mut v = Vec::with_capacity(ACCUMULATOR_BYTE_SIZE - 64);
-    acc.serialize(&mut v, UseCompression::No).unwrap();
-    assert_eq!(v.len(), ACCUMULATOR_BYTE_SIZE - 64);
-    let deserialized = Accumulator::deserialize(&mut &v[..], UseCompression::No, CheckForCorrectness::No).unwrap();
-    assert!(acc == deserialized);
+
+    {
+        let mut v = Vec::with_capacity(ACCUMULATOR_BYTE_SIZE - 64);
+        acc.serialize(&mut v, UseCompression::No).unwrap();
+        assert_eq!(v.len(), ACCUMULATOR_BYTE_SIZE - 64);
+        let deserialized = Accumulator::deserialize(&mut &v[..], UseCompression::No, CheckForCorrectness::No).unwrap();
+        assert!(acc == deserialized);
+    }
+
+    {
+        let expect_size = CONTRIBUTION_BYTE_SIZE - 64 - PUBLIC_KEY_SIZE;
+        let mut v = Vec::with_capacity(expect_size);
+        acc.serialize(&mut v, UseCompression::Yes).unwrap();
+        assert_eq!(expect_size, v.len());
+        let deserialized = Accumulator::deserialize(
+            &mut &v[..],
+            UseCompression::Yes,
+            CheckForCorrectness::No).unwrap();
+        assert!(acc == deserialized);
+    }
 }
 
 /// Compute BLAKE2b("")
