@@ -110,7 +110,7 @@ fn main() {
         // deserialize it.
         let response_file_accumulator = Accumulator::deserialize(
             &mut reader,
-            UseCompression::No,
+            UseCompression::Yes,
             CheckForCorrectness::Yes
         ).expect("unable to read uncompressed accumulator");
 
