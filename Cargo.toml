@@ -21,6 +21,7 @@ pairing = "0.14"
 hex-literal = "0.1"
 rust-crypto = "0.2"
 bellman = "0.1"
+getopts = "0.2.21"
 
 [features]
 u128-support = ["pairing/u128-support"]

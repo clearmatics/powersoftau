@@ -5,8 +5,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write, BufWriter, BufReader};
 
 fn main() {
-    let config = Configuration::default();
-
+    let config = cmd_utils::parse_simple_options();
     // Try to load `./challenge` from disk.
     let challenge_reader = OpenOptions::new()
                             .read(true)

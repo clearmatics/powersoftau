@@ -1,11 +1,10 @@
 extern crate powersoftau;
 use powersoftau::*;
-
 use std::fs::OpenOptions;
 use std::io::{Write, BufWriter};
 
 fn main() {
-    let config = Configuration::default();
+    let config = cmd_utils::parse_simple_options();
     let writer = OpenOptions::new()
                             .read(false)
                             .write(true)

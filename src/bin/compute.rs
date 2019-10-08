@@ -4,12 +4,11 @@ extern crate blake2;
 extern crate byteorder;
 
 use powersoftau::*;
-
 use std::fs::OpenOptions;
 use std::io::{self, Read, BufReader, Write, BufWriter};
 
 fn main() {
-    let config = Configuration::default();
+    let config = cmd_utils::parse_simple_options();
     // Create an RNG based on a mixture of system randomness and user provided randomness
     let mut rng = {
         use byteorder::{ReadBytesExt, BigEndian};

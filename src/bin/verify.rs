@@ -79,7 +79,7 @@ fn get_response_file_hash(
 }
 
 fn main() {
-    let config = Configuration::default();
+    let config = cmd_utils::parse_simple_options();
     // Try to load `./transcript` from disk.
     let reader = OpenOptions::new()
                             .read(true)
@@ -155,7 +155,7 @@ fn main() {
     let worker = &Worker::new();
 
     // Create the parameters for various 2^m circuit depths.
-    for m in 0..22 {
+    for m in 0..config.num_powers_log2 {
         let paramname = format!("phase1radix2m{}", m);
         println!("Creating {}", paramname);
 
@@ -178,7 +178,7 @@ fn main() {
                 .map(|e| Point(e.into_projective()))
                 .collect()
         ).unwrap();
-        
+
         let mut g1_beta_coeffs = EvaluationDomain::from_coeffs(
             current_accumulator.beta_tau_powers_g1[0..degree].iter()
                 .map(|e| Point(e.into_projective()))
