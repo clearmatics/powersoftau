@@ -72,7 +72,7 @@ fn get_response_file_hash(
 }
 
 fn main() {
-    let config = Configuration::default();
+    let config = cmd_utils::parse_simple_options();
     // Try to load `./transcript` from disk.
     let reader = OpenOptions::new()
                             .read(true)

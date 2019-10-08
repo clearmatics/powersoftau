@@ -14,7 +14,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, BufReader, Write, BufWriter};
 
 fn main() {
-    let config = Configuration::default();
+    let config = cmd_utils::parse_simple_options();
     // Create an RNG based on the outcome of the random beacon
     let mut rng = {
         use byteorder::{ReadBytesExt, BigEndian};
