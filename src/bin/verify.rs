@@ -79,6 +79,7 @@ fn get_response_file_hash(
 }
 
 fn main() {
+    let config = Configuration::default();
     // Try to load `./transcript` from disk.
     let reader = OpenOptions::new()
                             .read(true)
@@ -88,7 +89,7 @@ fn main() {
     let mut reader = BufReader::with_capacity(1024 * 1024, reader);
 
     // Initialize the accumulator
-    let mut current_accumulator = Accumulator::new();
+    let mut current_accumulator = Accumulator::new(config);
 
     // The "last response file hash" is just a blank BLAKE2b hash
     // at the beginning of the hash chain.
@@ -109,6 +110,7 @@ fn main() {
         // uncompressed form so that we can more efficiently
         // deserialize it.
         let response_file_accumulator = Accumulator::deserialize(
+            config,
             &mut reader,
             UseCompression::Yes,
             CheckForCorrectness::Yes

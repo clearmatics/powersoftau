@@ -53,36 +53,69 @@ const G2_UNCOMPRESSED_BYTE_SIZE: usize = 192;
 const G1_COMPRESSED_BYTE_SIZE: usize = 48;
 const G2_COMPRESSED_BYTE_SIZE: usize = 96;
 
-/// The accumulator supports circuits with 2^21 multiplication gates.
-const TAU_POWERS_LENGTH: usize = (1 << 21);
-
-/// More tau powers are needed in G1 because the Groth16 H query
-/// includes terms of the form tau^i * (tau^m - 1) = tau^(i+m) - tau^i
-/// where the largest i = m - 2, requiring the computation of tau^(2m - 2)
-/// and thus giving us a vector length of 2^22 - 1.
-const TAU_POWERS_G1_LENGTH: usize = (TAU_POWERS_LENGTH << 1) - 1;
-
-/// The size of the accumulator on disk.
-pub const ACCUMULATOR_BYTE_SIZE: usize = (TAU_POWERS_G1_LENGTH * G1_UNCOMPRESSED_BYTE_SIZE) + // g1 tau powers
-                                         (TAU_POWERS_LENGTH * G2_UNCOMPRESSED_BYTE_SIZE) + // g2 tau powers
-                                         (TAU_POWERS_LENGTH * G1_UNCOMPRESSED_BYTE_SIZE) + // alpha tau powers
-                                         (TAU_POWERS_LENGTH * G1_UNCOMPRESSED_BYTE_SIZE) // beta tau powers
-                                         + G2_UNCOMPRESSED_BYTE_SIZE // beta in g2
-                                         + 64; // blake2b hash of previous contribution
+const DEFAULT_NUM_POWERS: usize = (1 << 21);
 
 /// The "public key" is used to verify a contribution was correctly
 /// computed.
-pub const PUBLIC_KEY_SIZE: usize = 3 * G2_UNCOMPRESSED_BYTE_SIZE + // tau, alpha, and beta in g2
-                                   6 * G1_UNCOMPRESSED_BYTE_SIZE; // (s1, s1*tau), (s2, s2*alpha), (s3, s3*beta) in g1
+pub const PUBLIC_KEY_SIZE: usize =
+    3 * G2_UNCOMPRESSED_BYTE_SIZE + // tau, alpha, and beta in g2
+    6 * G1_UNCOMPRESSED_BYTE_SIZE; // (s1, s1*tau), (s2, s2*alpha), (s3, s3*beta) in g1
 
-/// The size of the contribution on disk.
-pub const CONTRIBUTION_BYTE_SIZE: usize = (TAU_POWERS_G1_LENGTH * G1_COMPRESSED_BYTE_SIZE) + // g1 tau powers
-                                          (TAU_POWERS_LENGTH * G2_COMPRESSED_BYTE_SIZE) + // g2 tau powers
-                                          (TAU_POWERS_LENGTH * G1_COMPRESSED_BYTE_SIZE) + // alpha tau powers
-                                          (TAU_POWERS_LENGTH * G1_COMPRESSED_BYTE_SIZE) // beta tau powers
-                                          + G2_COMPRESSED_BYTE_SIZE // beta in g2
-                                          + 64 // blake2b hash of input accumulator
-                                          + PUBLIC_KEY_SIZE; // public key
+fn is_pow2(v: usize) -> bool {
+    0 == (v & (v-1))
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub struct Configuration {
+    /// The maximum number of gates to be supported by circuits
+    pub num_powers: usize,
+
+    /// More tau powers are needed in G1 because the Groth16 H query
+    /// includes terms of the form tau^i * (tau^m - 1) = tau^(i+m) - tau^i
+    /// where the largest i = m - 2, requiring the computation of tau^(2m - 2)
+    /// and thus giving us a vector length of 2^22 - 1.
+    pub num_powers_g1: usize,
+
+    /// The size of the accumulator on disk.
+    pub accumulator_size_bytes: usize,
+
+    /// The size of the contribution on disk.
+    pub contribution_size_bytes: usize,
+}
+
+impl Configuration {
+    pub fn new(num_powers: usize) -> Self
+    {
+        assert!(is_pow2(num_powers));
+        let num_powers_g1 = (num_powers << 1) - 1;
+        let accumulator_size =
+            (num_powers_g1 * G1_UNCOMPRESSED_BYTE_SIZE) + // g1 tau powers
+            (num_powers * G2_UNCOMPRESSED_BYTE_SIZE) + // g2 tau powers
+            (num_powers * G1_UNCOMPRESSED_BYTE_SIZE) + // alpha tau powers
+            (num_powers * G1_UNCOMPRESSED_BYTE_SIZE) // beta tau powers
+            + G2_UNCOMPRESSED_BYTE_SIZE // beta in g2
+            + 64; // blake2b hash of previous contribution
+        let contribution_size =
+            (num_powers_g1 * G1_COMPRESSED_BYTE_SIZE) + // g1 tau powers
+            (num_powers * G2_COMPRESSED_BYTE_SIZE) + // g2 tau powers
+            (num_powers * G1_COMPRESSED_BYTE_SIZE) + // alpha tau powers
+            (num_powers * G1_COMPRESSED_BYTE_SIZE) // beta tau powers
+            + G2_COMPRESSED_BYTE_SIZE // beta in g2
+            + 64 // blake2b hash of input accumulator
+            + PUBLIC_KEY_SIZE; // public key
+        Configuration {
+            num_powers: num_powers,
+            num_powers_g1: num_powers_g1,
+            accumulator_size_bytes: accumulator_size,
+            contribution_size_bytes: contribution_size
+        }
+    }
+
+    pub fn default() -> Self
+    {
+        Self::new(DEFAULT_NUM_POWERS)
+    }
+}
 
 /// Hashes to G2 using the first 32 bytes of `digest`. Panics if `digest` is less
 /// than 32 bytes.
@@ -351,18 +384,20 @@ pub struct Accumulator {
     /// beta * tau^0, beta * tau^1, beta * tau^2, ..., beta * tau^{TAU_POWERS_LENGTH - 1}
     pub beta_tau_powers_g1: Vec<G1Affine>,
     /// beta
-    pub beta_g2: G2Affine
+    pub beta_g2: G2Affine,
+    pub config: Configuration,
 }
 
 impl Accumulator {
     /// Constructs an "initial" accumulator with τ = 1, α = 1, β = 1.
-    pub fn new() -> Self {
+    pub fn new(config: Configuration) -> Self {
         Accumulator {
-            tau_powers_g1: vec![G1Affine::one(); TAU_POWERS_G1_LENGTH],
-            tau_powers_g2: vec![G2Affine::one(); TAU_POWERS_LENGTH],
-            alpha_tau_powers_g1: vec![G1Affine::one(); TAU_POWERS_LENGTH],
-            beta_tau_powers_g1: vec![G1Affine::one(); TAU_POWERS_LENGTH],
-            beta_g2: G2Affine::one()
+            tau_powers_g1: vec![G1Affine::one(); config.num_powers_g1],
+            tau_powers_g2: vec![G2Affine::one(); config.num_powers],
+            alpha_tau_powers_g1: vec![G1Affine::one(); config.num_powers],
+            beta_tau_powers_g1: vec![G1Affine::one(); config.num_powers],
+            beta_g2: G2Affine::one(),
+            config: config,
         }
     }
 
@@ -399,6 +434,7 @@ impl Accumulator {
     /// indicates whether we should check it's a valid element of the group and
     /// not the point at infinity.
     pub fn deserialize<R: Read>(
+        config: Configuration,
         reader: &mut R,
         compression: UseCompression,
         checked: CheckForCorrectness
@@ -491,10 +527,14 @@ impl Accumulator {
             }
         }
 
-        let tau_powers_g1 = read_all(reader, TAU_POWERS_G1_LENGTH, compression, checked)?;
-        let tau_powers_g2 = read_all(reader, TAU_POWERS_LENGTH, compression, checked)?;
-        let alpha_tau_powers_g1 = read_all(reader, TAU_POWERS_LENGTH, compression, checked)?;
-        let beta_tau_powers_g1 = read_all(reader, TAU_POWERS_LENGTH, compression, checked)?;
+        let tau_powers_g1 = read_all(
+            reader, config.num_powers_g1, compression, checked)?;
+        let tau_powers_g2 = read_all(
+            reader, config.num_powers, compression, checked)?;
+        let alpha_tau_powers_g1 = read_all(
+            reader, config.num_powers, compression, checked)?;
+        let beta_tau_powers_g1 = read_all(
+            reader, config.num_powers, compression, checked)?;
         let beta_g2 = read_all(reader, 1, compression, checked)?[0];
 
         Ok(Accumulator {
@@ -502,7 +542,8 @@ impl Accumulator {
             tau_powers_g2: tau_powers_g2,
             alpha_tau_powers_g1: alpha_tau_powers_g1,
             beta_tau_powers_g1: beta_tau_powers_g1,
-            beta_g2: beta_g2
+            beta_g2: beta_g2,
+            config: config,
         })
     }
 
@@ -510,8 +551,8 @@ impl Accumulator {
     pub fn transform(&mut self, key: &PrivateKey)
     {
         // Construct the powers of tau
-        let mut taupowers = vec![Fr::zero(); TAU_POWERS_G1_LENGTH];
-        let chunk_size = TAU_POWERS_G1_LENGTH / num_cpus::get();
+        let mut taupowers = vec![Fr::zero(); self.config.num_powers_g1];
+        let chunk_size = self.config.num_powers_g1 / num_cpus::get();
 
         // Construct exponents in parallel
         crossbeam::scope(|scope| {
@@ -574,10 +615,11 @@ impl Accumulator {
             }
         }
 
+        let num_powers = self.config.num_powers;
         batch_exp(&mut self.tau_powers_g1, &taupowers[0..], None);
-        batch_exp(&mut self.tau_powers_g2, &taupowers[0..TAU_POWERS_LENGTH], None);
-        batch_exp(&mut self.alpha_tau_powers_g1, &taupowers[0..TAU_POWERS_LENGTH], Some(&key.alpha));
-        batch_exp(&mut self.beta_tau_powers_g1, &taupowers[0..TAU_POWERS_LENGTH], Some(&key.beta));
+        batch_exp(&mut self.tau_powers_g2, &taupowers[0..num_powers], None);
+        batch_exp(&mut self.alpha_tau_powers_g1, &taupowers[0..num_powers], Some(&key.alpha));
+        batch_exp(&mut self.beta_tau_powers_g1, &taupowers[0..num_powers], Some(&key.beta));
         self.beta_g2 = self.beta_g2.mul(key.beta).into_affine();
     }
 }
@@ -764,21 +806,42 @@ fn test_same_ratio() {
 fn test_accumulator_serialization() {
     use rand::thread_rng;
 
+    let config = Configuration::new(256);
     let rng = &mut thread_rng();
     let mut digest = (0..64).map(|_| rng.gen()).collect::<Vec<_>>();
 
-    let mut acc = Accumulator::new();
+    let mut acc = Accumulator::new(config);
     let before = acc.clone();
     let (pk, sk) = keypair(rng, &digest);
     acc.transform(&sk);
     assert!(verify_transform(&before, &acc, &pk, &digest));
     digest[0] = !digest[0];
     assert!(!verify_transform(&before, &acc, &pk, &digest));
-    let mut v = Vec::with_capacity(ACCUMULATOR_BYTE_SIZE - 64);
-    acc.serialize(&mut v, UseCompression::No).unwrap();
-    assert_eq!(v.len(), ACCUMULATOR_BYTE_SIZE - 64);
-    let deserialized = Accumulator::deserialize(&mut &v[..], UseCompression::No, CheckForCorrectness::No).unwrap();
-    assert!(acc == deserialized);
+
+    {
+        let mut v = Vec::with_capacity(config.accumulator_size_bytes - 64);
+        acc.serialize(&mut v, UseCompression::No).unwrap();
+        assert_eq!(v.len(), config.accumulator_size_bytes - 64);
+        let deserialized = Accumulator::deserialize(
+            config,
+            &mut &v[..],
+            UseCompression::No,
+            CheckForCorrectness::No).unwrap();
+        assert!(acc == deserialized);
+    }
+
+    {
+        let expect_size = config.contribution_size_bytes - 64 - PUBLIC_KEY_SIZE;
+        let mut v = Vec::with_capacity(expect_size);
+        acc.serialize(&mut v, UseCompression::Yes).unwrap();
+        assert_eq!(expect_size, v.len());
+        let deserialized = Accumulator::deserialize(
+            config,
+            &mut &v[..],
+            UseCompression::Yes,
+            CheckForCorrectness::No).unwrap();
+        assert!(acc == deserialized);
+    }
 }
 
 /// Compute BLAKE2b("")
