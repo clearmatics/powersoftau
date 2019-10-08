@@ -14,6 +14,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, BufReader, Write, BufWriter};
 
 fn main() {
+    let config = Configuration::default();
     // Create an RNG based on the outcome of the random beacon
     let mut rng = {
         use byteorder::{ReadBytesExt, BigEndian};
@@ -69,8 +70,11 @@ fn main() {
 
     {
         let metadata = reader.metadata().expect("unable to get filesystem metadata for `./challenge`");
-        if metadata.len() != (ACCUMULATOR_BYTE_SIZE as u64) {
-            panic!("The size of `./challenge` should be {}, but it's {}, so something isn't right.", ACCUMULATOR_BYTE_SIZE, metadata.len());
+        if metadata.len() != (config.accumulator_size_bytes as u64) {
+            panic!(
+                "The size of `./challenge` should be {}, but it's {}, so something isn't right.",
+                config.accumulator_size_bytes,
+                metadata.len());
         }
     }
 
@@ -98,7 +102,12 @@ fn main() {
     }
 
     // Load the current accumulator into memory
-    let mut current_accumulator = Accumulator::deserialize(&mut reader, UseCompression::No, CheckForCorrectness::No).expect("unable to read uncompressed accumulator");
+    let mut current_accumulator = Accumulator::deserialize(
+        config,
+        &mut reader,
+        UseCompression::No,
+        CheckForCorrectness::No)
+        .expect("unable to read uncompressed accumulator");
 
     // Get the hash of the current accumulator
     let current_accumulator_hash = reader.into_hash();
