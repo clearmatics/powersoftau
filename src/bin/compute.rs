@@ -2,13 +2,25 @@ extern crate powersoftau;
 extern crate rand;
 extern crate blake2;
 extern crate byteorder;
+extern crate getopts;
 
 use powersoftau::*;
+use powersoftau::cmd_utils::*;
 use std::fs::OpenOptions;
 use std::io::{self, Read, BufReader, Write, BufWriter};
 
 fn main() {
-    let config = cmd_utils::parse_simple_options();
+    let mut opts = getopts::Options::new();
+    opts.optflag("h", "help", "print this help");
+    opts.optopt("n", "", "number of tau powers", "NUM_POWERS");
+    opts.optopt("d", "digest", "file to write digest to", "FILE");
+    let matches = match_or_fail(&opts);
+
+    let num_powers : usize =
+        get_opt_default(&matches, "n", configuration::DEFAULT_NUM_POWERS);
+    let config = configuration::Configuration::new(num_powers);
+    let digest_file_opt : Option<String> = get_opt(&matches, "d");
+
     // Create an RNG based on a mixture of system randomness and user provided randomness
     let mut rng = {
         use byteorder::{ReadBytesExt, BigEndian};
@@ -121,16 +133,19 @@ fn main() {
               Your contribution has been written to `./response`\n\n\
               The BLAKE2b hash of `./response` is:\n");
 
-    for line in contribution_hash.as_slice().chunks(16) {
-        print!("\t");
-        for section in line.chunks(4) {
-            for b in section {
-                print!("{:02x}", b);
-            }
-            print!(" ");
-        }
-        println!("");
-    }
+    let hash_str = digest_to_string(contribution_hash.as_slice());
+    print!("{}", hash_str);
 
-    println!("\n");
+    match digest_file_opt {
+        Some(digest_file) => {
+            let mut digest_writer = OpenOptions::new()
+                .read(false)
+                .write(true)
+                .create(true)
+                .open(&digest_file).expect("unable to create digest file");
+            digest_writer.write(hash_str.as_bytes()).expect("digest write failed");
+            println!("\nDigest written to `{}'", &digest_file);
+        }
+        None => {}
+    }
 }
