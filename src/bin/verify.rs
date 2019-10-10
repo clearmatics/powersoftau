@@ -5,6 +5,7 @@ extern crate blake2;
 extern crate byteorder;
 
 use powersoftau::*;
+use powersoftau::cmd_utils::*;
 use std::fs::OpenOptions;
 use std::io::{self, BufReader, Write};
 
@@ -72,7 +73,18 @@ fn get_response_file_hash(
 }
 
 fn main() {
-    let config = cmd_utils::parse_simple_options();
+    let mut opts = getopts::Options::new();
+    opts.optflag("h", "help", "print this help");
+    opts.optopt("n", "", "number of tau powers", "NUM_POWERS");
+    opts.optopt("r", "rounds", "number of rounds", "NUM_ROUNDS");
+    let matches = match_or_fail(&opts);
+
+    let config = configuration::Configuration::new(
+        get_opt_default(&matches, "n", configuration::DEFAULT_NUM_POWERS));
+    // 89 hard-coded into original code
+    let num_rounds = get_opt_default(&matches, "r", 89);
+
+
     // Try to load `./transcript` from disk.
     let reader = OpenOptions::new()
                             .read(true)
@@ -89,8 +101,9 @@ fn main() {
     let mut last_response_file_hash = [0; 64];
     last_response_file_hash.copy_from_slice(blank_hash().as_slice());
 
-    // There were 89 rounds.
-    for _ in 0..89 {
+    for r in 0..num_rounds {
+        println!("Round: {}", r);
+
         // Compute the hash of the challenge file that the player
         // should have received.
         let last_challenge_file_hash = get_challenge_file_hash(
