@@ -4,9 +4,12 @@ use configuration::*;
 use std::str::FromStr;
 use std::env;
 
-pub fn digest_from_string(s: &String) -> Result<[u8; 64], String>
+pub const DIGEST_LENGTH : usize = 64;
+pub const DIGEST_STRING_LENGTH : usize = (DIGEST_LENGTH * 2) + 4 * 4;
+
+pub fn digest_from_string(s: &String) -> Result<[u8; DIGEST_LENGTH], String>
 {
-    let mut out = [0u8;64];
+    let mut out = [0u8;DIGEST_LENGTH];
 
     let mut idx = 0;
     for line in out.chunks_mut(16) {
@@ -19,14 +22,18 @@ pub fn digest_from_string(s: &String) -> Result<[u8; 64], String>
     return Ok(out);
 }
 
+pub fn digest_equal(a: &[u8; DIGEST_LENGTH], b: &[u8; DIGEST_LENGTH]) -> bool
+{
+    a.iter().zip(b.iter()).all(|(a_el,b_el)| a_el == b_el)
+}
+
 // fn digest_to_string(digest: &[u8; 64]) -> String {
 pub fn digest_to_string(digest: &[u8]) -> String
 {
     use std::fmt::Write;
 
     // 4 lines, each with 4 x 8-char hex string + whitespace)
-    const SIZE : usize = 4 * (4 * 8 + 4);
-    let mut out = String::with_capacity(SIZE);
+    let mut out = String::with_capacity(DIGEST_STRING_LENGTH);
     for line in digest.chunks(16) {
         let mut chunks = line.chunks(4);
         for b in chunks.next().unwrap() { out.write_fmt(format_args!("{:02x}", b)).unwrap(); }

@@ -12,7 +12,7 @@ cargo run --bin new ${FLAGS}
 
 # Round 1
 
-echo random1 | cargo run --bin compute ${FLAGS} --digest response.1.digest
+echo random1 | cargo run --bin compute ${FLAGS}
 # Your contribution has been written to `./response`
 
 cargo run --bin verify_transform ${FLAGS}
@@ -24,7 +24,7 @@ mv new_challenge challenge
 
 # Round 2
 
-echo random2 | cargo run --bin compute ${FLAGS}
+echo random2 | cargo run --bin compute ${FLAGS} --digest response.2.digest
 # Your contribution has been written to `./response`
 
 cargo run --bin verify_transform ${FLAGS}
@@ -63,4 +63,16 @@ rm -f transcript
 for f in response.1 response.2 response.3 response.4.beacon ; do
     dd if=$f bs=64 skip=1 >> transcript
 done
+
+echo Verifying transcript ...
 cargo run --bin verify ${FLAGS} -r 4
+
+echo Verifying transcript contains contribution ...
+cargo run --bin verify ${FLAGS} -r 4 --digest response.2.digest
+
+echo Verifying transcript does not contain invalid contribution ...
+sed -e 's/0/1/g' response.2.digest > response.2.invalid.digest
+if (cargo run --bin verify ${FLAGS} -r 4 --digest response.2.invalid.digest) ; then
+    echo Verification failed
+    return 1
+fi
