@@ -5,6 +5,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write, BufWriter, BufReader};
 
 fn main() {
+    let config = cmd_utils::parse_simple_options();
     // Try to load `./challenge` from disk.
     let challenge_reader = OpenOptions::new()
                             .read(true)
@@ -12,8 +13,11 @@ fn main() {
 
     {
         let metadata = challenge_reader.metadata().expect("unable to get filesystem metadata for `./challenge`");
-        if metadata.len() != (ACCUMULATOR_BYTE_SIZE as u64) {
-            panic!("The size of `./challenge` should be {}, but it's {}, so something isn't right.", ACCUMULATOR_BYTE_SIZE, metadata.len());
+        if metadata.len() != (config.accumulator_size_bytes as u64) {
+            panic!(
+                "The size of `./challenge` should be {}, but it's {}, so something isn't right.",
+                config.accumulator_size_bytes,
+                metadata.len());
         }
     }
 
@@ -27,8 +31,11 @@ fn main() {
 
     {
         let metadata = response_reader.metadata().expect("unable to get filesystem metadata for `./response`");
-        if metadata.len() != (CONTRIBUTION_BYTE_SIZE as u64) {
-            panic!("The size of `./response` should be {}, but it's {}, so something isn't right.", CONTRIBUTION_BYTE_SIZE, metadata.len());
+        if metadata.len() != (config.contribution_size_bytes as u64) {
+            panic!(
+                "The size of `./response` should be {}, but it's {}, so something isn't right.",
+                config.contribution_size_bytes,
+                metadata.len());
         }
     }
 
@@ -56,6 +63,7 @@ fn main() {
 
     // Load the current accumulator into memory
     let current_accumulator = Accumulator::deserialize(
+        config,
         &mut challenge_reader,
         UseCompression::No,
         CheckForCorrectness::No // no need to check since we constructed the challenge already
@@ -77,8 +85,11 @@ fn main() {
     }
 
     // Load the response's accumulator
-    let new_accumulator = Accumulator::deserialize(&mut response_reader, UseCompression::Yes, CheckForCorrectness::Yes)
-                                                  .expect("wasn't able to deserialize the response file's accumulator");
+    let new_accumulator = Accumulator::deserialize(
+        config,
+        &mut response_reader,
+        UseCompression::Yes, CheckForCorrectness::Yes)
+        .expect("wasn't able to deserialize the response file's accumulator");
 
     // Load the response's pubkey
     let public_key = PublicKey::deserialize(&mut response_reader)

@@ -1,19 +1,14 @@
-extern crate pairing;
+extern crate bn;
 extern crate powersoftau;
 extern crate rand;
 extern crate blake2;
 extern crate byteorder;
-extern crate bellman;
 
-use pairing::{CurveAffine, CurveProjective};
-use pairing::bls12_381::{G1, G2};
 use powersoftau::*;
-
-use bellman::multicore::Worker;
-use bellman::domain::{EvaluationDomain, Point};
-
+use powersoftau::cmd_utils::*;
+use std::str;
 use std::fs::OpenOptions;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, Write, Read};
 
 fn into_hex(h: &[u8]) -> String {
     let mut f = String::new();
@@ -79,6 +74,34 @@ fn get_response_file_hash(
 }
 
 fn main() {
+    let mut opts = getopts::Options::new();
+    opts.optflag("h", "help", "print this help");
+    opts.optopt("n", "", "number of tau powers", "NUM_POWERS");
+    opts.optopt("r", "rounds", "number of rounds", "NUM_ROUNDS");
+    opts.optopt("d", "digest", "check contribution with given digest", "FILE");
+    opts.optflag("s", "skip-lagrange", "skip generation of phase1radix2m files");
+    let matches = match_or_fail(&opts);
+
+    let config = configuration::Configuration::new(
+        get_opt_default(&matches, "n", configuration::DEFAULT_NUM_POWERS));
+    // 89 hard-coded into original code
+    let num_rounds = get_opt_default(&matches, "r", 89);
+    let skip_lagrange = matches.opt_present("s");
+    let digest_file_opt : Option<String> = get_opt(&matches, "d");
+    let contrib_digest_opt : Option<[u8;DIGEST_LENGTH]> = digest_file_opt
+        .as_ref()
+        .map(|digest_file| {
+            let mut digest_reader = OpenOptions::new()
+                .read(true).open(digest_file).expect("failed to open digest file");
+            let mut digest_buffer = [0u8; DIGEST_STRING_LENGTH];
+            digest_reader.read_exact(&mut digest_buffer).expect("invalid digest file size");
+            let digest_string = String::from(
+                str::from_utf8(&digest_buffer).expect("invalid digest data"));
+            let digest : [u8; DIGEST_LENGTH] =
+                digest_from_string(&digest_string).expect("invalid digest file");
+            digest
+        });
+
     // Try to load `./transcript` from disk.
     let reader = OpenOptions::new()
                             .read(true)
@@ -88,15 +111,18 @@ fn main() {
     let mut reader = BufReader::with_capacity(1024 * 1024, reader);
 
     // Initialize the accumulator
-    let mut current_accumulator = Accumulator::new();
+    let mut current_accumulator = Accumulator::new(config);
 
     // The "last response file hash" is just a blank BLAKE2b hash
     // at the beginning of the hash chain.
     let mut last_response_file_hash = [0; 64];
     last_response_file_hash.copy_from_slice(blank_hash().as_slice());
 
-    // There were 89 rounds.
-    for _ in 0..89 {
+    // If a digest was specified, check the transcript to ensure it is
+    // included.
+    let mut found_digest : bool = contrib_digest_opt.is_none();
+
+    for _ in 0..num_rounds {
         // Compute the hash of the challenge file that the player
         // should have received.
         let last_challenge_file_hash = get_challenge_file_hash(
@@ -109,8 +135,9 @@ fn main() {
         // uncompressed form so that we can more efficiently
         // deserialize it.
         let response_file_accumulator = Accumulator::deserialize(
+            config,
             &mut reader,
-            UseCompression::No,
+            UseCompression::Yes,
             CheckForCorrectness::Yes
         ).expect("unable to read uncompressed accumulator");
 
@@ -126,6 +153,11 @@ fn main() {
             &response_file_pubkey,
             &last_challenge_file_hash
         );
+
+        if !found_digest {
+            found_digest = digest_equal(
+                &last_response_file_hash, &contrib_digest_opt.expect(""));
+        }
 
         print!("{}", into_hex(&last_response_file_hash));
 
@@ -150,190 +182,11 @@ fn main() {
 
     println!("Transcript OK!");
 
-    let worker = &Worker::new();
-
-    // Create the parameters for various 2^m circuit depths.
-    for m in 0..22 {
-        let paramname = format!("phase1radix2m{}", m);
-        println!("Creating {}", paramname);
-
-        let degree = 1 << m;
-
-        let mut g1_coeffs = EvaluationDomain::from_coeffs(
-            current_accumulator.tau_powers_g1[0..degree].iter()
-                .map(|e| Point(e.into_projective()))
-                .collect()
-        ).unwrap();
-
-        let mut g2_coeffs = EvaluationDomain::from_coeffs(
-            current_accumulator.tau_powers_g2[0..degree].iter()
-                .map(|e| Point(e.into_projective()))
-                .collect()
-        ).unwrap();
-
-        let mut g1_alpha_coeffs = EvaluationDomain::from_coeffs(
-            current_accumulator.alpha_tau_powers_g1[0..degree].iter()
-                .map(|e| Point(e.into_projective()))
-                .collect()
-        ).unwrap();
-        
-        let mut g1_beta_coeffs = EvaluationDomain::from_coeffs(
-            current_accumulator.beta_tau_powers_g1[0..degree].iter()
-                .map(|e| Point(e.into_projective()))
-                .collect()
-        ).unwrap();
-
-        // This converts all of the elements into Lagrange coefficients
-        // for later construction of interpolation polynomials
-        g1_coeffs.ifft(&worker);
-        g2_coeffs.ifft(&worker);
-        g1_alpha_coeffs.ifft(&worker);
-        g1_beta_coeffs.ifft(&worker);
-
-        let g1_coeffs = g1_coeffs.into_coeffs();
-        let g2_coeffs = g2_coeffs.into_coeffs();
-        let g1_alpha_coeffs = g1_alpha_coeffs.into_coeffs();
-        let g1_beta_coeffs = g1_beta_coeffs.into_coeffs();
-
-        assert_eq!(g1_coeffs.len(), degree);
-        assert_eq!(g2_coeffs.len(), degree);
-        assert_eq!(g1_alpha_coeffs.len(), degree);
-        assert_eq!(g1_beta_coeffs.len(), degree);
-
-        // Remove the Point() wrappers
-
-        let mut g1_coeffs = g1_coeffs.into_iter()
-            .map(|e| e.0)
-            .collect::<Vec<_>>();
-
-        let mut g2_coeffs = g2_coeffs.into_iter()
-            .map(|e| e.0)
-            .collect::<Vec<_>>();
-
-        let mut g1_alpha_coeffs = g1_alpha_coeffs.into_iter()
-            .map(|e| e.0)
-            .collect::<Vec<_>>();
-
-        let mut g1_beta_coeffs = g1_beta_coeffs.into_iter()
-            .map(|e| e.0)
-            .collect::<Vec<_>>();
-
-        // Batch normalize
-        G1::batch_normalization(&mut g1_coeffs);
-        G2::batch_normalization(&mut g2_coeffs);
-        G1::batch_normalization(&mut g1_alpha_coeffs);
-        G1::batch_normalization(&mut g1_beta_coeffs);
-
-        // H query of Groth16 needs...
-        // x^i * (x^m - 1) for i in 0..=(m-2) a.k.a.
-        // x^(i + m) - x^i for i in 0..=(m-2)
-        // for radix2 evaluation domains
-        let mut h = Vec::with_capacity(degree - 1);
-        for i in 0..(degree-1) {
-            let mut tmp = current_accumulator.tau_powers_g1[i + degree].into_projective();
-            let mut tmp2 = current_accumulator.tau_powers_g1[i].into_projective();
-            tmp2.negate();
-            tmp.add_assign(&tmp2);
-
-            h.push(tmp);
-        }
-
-        // Batch normalize this as well
-        G1::batch_normalization(&mut h);
-
-        // Create the parameter file
-        let writer = OpenOptions::new()
-                            .read(false)
-                            .write(true)
-                            .create_new(true)
-                            .open(paramname)
-                            .expect("unable to create parameter file in this directory");
-
-        let mut writer = BufWriter::new(writer);
-
-        // Write alpha (in g1)
-        // Needed by verifier for e(alpha, beta)
-        // Needed by prover for A and C elements of proof
-        writer.write_all(
-            current_accumulator.alpha_tau_powers_g1[0]
-                .into_uncompressed()
-                .as_ref()
-        ).unwrap();
-
-        // Write beta (in g1)
-        // Needed by prover for C element of proof
-        writer.write_all(
-            current_accumulator.beta_tau_powers_g1[0]
-                .into_uncompressed()
-                .as_ref()
-        ).unwrap();
-
-        // Write beta (in g2)
-        // Needed by verifier for e(alpha, beta)
-        // Needed by prover for B element of proof
-        writer.write_all(
-            current_accumulator.beta_g2
-                .into_uncompressed()
-                .as_ref()
-        ).unwrap();
-
-        // Lagrange coefficients in G1 (for constructing
-        // LC/IC queries and precomputing polynomials for A)
-        for coeff in g1_coeffs {
-            // Was normalized earlier in parallel
-            let coeff = coeff.into_affine();
-
-            writer.write_all(
-                coeff.into_uncompressed()
-                    .as_ref()
-            ).unwrap();
-        }
-
-        // Lagrange coefficients in G2 (for precomputing
-        // polynomials for B)
-        for coeff in g2_coeffs {
-            // Was normalized earlier in parallel
-            let coeff = coeff.into_affine();
-
-            writer.write_all(
-                coeff.into_uncompressed()
-                    .as_ref()
-            ).unwrap();
-        }
-
-        // Lagrange coefficients in G1 with alpha (for
-        // LC/IC queries)
-        for coeff in g1_alpha_coeffs {
-            // Was normalized earlier in parallel
-            let coeff = coeff.into_affine();
-
-            writer.write_all(
-                coeff.into_uncompressed()
-                    .as_ref()
-            ).unwrap();
-        }
-
-        // Lagrange coefficients in G1 with beta (for
-        // LC/IC queries)
-        for coeff in g1_beta_coeffs {
-            // Was normalized earlier in parallel
-            let coeff = coeff.into_affine();
-
-            writer.write_all(
-                coeff.into_uncompressed()
-                    .as_ref()
-            ).unwrap();
-        }
-
-        // Bases for H polynomial computation
-        for coeff in h {
-            // Was normalized earlier in parallel
-            let coeff = coeff.into_affine();
-
-            writer.write_all(
-                coeff.into_uncompressed()
-                    .as_ref()
-            ).unwrap();
-        }
+    if !found_digest {
+        println!("Digest not found!");
+        std::process::exit(1);
+    }
+    if skip_lagrange {
+        println!("WARNING: --skip-lagrange flag unused");
     }
 }

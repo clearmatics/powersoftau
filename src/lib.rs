@@ -1,5 +1,5 @@
 //! This ceremony constructs the "powers of tau" for Jens Groth's 2016 zk-SNARK proving
-//! system using the BLS12-381 pairing-friendly elliptic curve construction.
+//! system using the BN256 pairing-friendly elliptic curve construction.
 //!
 //! # Overview
 //!
@@ -26,7 +26,7 @@
 //! simulated with a randomness beacon. The resulting `Accumulator` contains partial zk-SNARK
 //! public parameters for all circuits within a bounded size.
 
-extern crate pairing;
+extern crate bn;
 extern crate rand;
 extern crate crossbeam;
 extern crate num_cpus;
@@ -34,55 +34,29 @@ extern crate blake2;
 extern crate generic_array;
 extern crate typenum;
 extern crate byteorder;
+extern crate bincode;
+extern crate rustc_serialize;
 
+use arith::{U256};
 use byteorder::{ReadBytesExt, BigEndian};
-use rand::{SeedableRng, Rng, Rand};
+use rand::{SeedableRng, Rng};
 use rand::chacha::ChaChaRng;
-use pairing::bls12_381::*;
-use pairing::*;
+use bn::*;
+use std::ops::*;
+use bincode::{DecodingError, EncodingError};
+use rustc_serialize::{Decodable, Encodable};
+
+const INF : bincode::SizeLimit = bincode::SizeLimit::Infinite;
+
 use std::io::{self, Read, Write};
-use std::sync::{Arc, Mutex};
 use generic_array::GenericArray;
 use typenum::consts::U64;
 use blake2::{Blake2b, Digest};
 use std::fmt;
 
-// This ceremony is based on the BLS12-381 elliptic curve construction.
-const G1_UNCOMPRESSED_BYTE_SIZE: usize = 96;
-const G2_UNCOMPRESSED_BYTE_SIZE: usize = 192;
-const G1_COMPRESSED_BYTE_SIZE: usize = 48;
-const G2_COMPRESSED_BYTE_SIZE: usize = 96;
-
-/// The accumulator supports circuits with 2^21 multiplication gates.
-const TAU_POWERS_LENGTH: usize = (1 << 21);
-
-/// More tau powers are needed in G1 because the Groth16 H query
-/// includes terms of the form tau^i * (tau^m - 1) = tau^(i+m) - tau^i
-/// where the largest i = m - 2, requiring the computation of tau^(2m - 2)
-/// and thus giving us a vector length of 2^22 - 1.
-const TAU_POWERS_G1_LENGTH: usize = (TAU_POWERS_LENGTH << 1) - 1;
-
-/// The size of the accumulator on disk.
-pub const ACCUMULATOR_BYTE_SIZE: usize = (TAU_POWERS_G1_LENGTH * G1_UNCOMPRESSED_BYTE_SIZE) + // g1 tau powers
-                                         (TAU_POWERS_LENGTH * G2_UNCOMPRESSED_BYTE_SIZE) + // g2 tau powers
-                                         (TAU_POWERS_LENGTH * G1_UNCOMPRESSED_BYTE_SIZE) + // alpha tau powers
-                                         (TAU_POWERS_LENGTH * G1_UNCOMPRESSED_BYTE_SIZE) // beta tau powers
-                                         + G2_UNCOMPRESSED_BYTE_SIZE // beta in g2
-                                         + 64; // blake2b hash of previous contribution
-
-/// The "public key" is used to verify a contribution was correctly
-/// computed.
-pub const PUBLIC_KEY_SIZE: usize = 3 * G2_UNCOMPRESSED_BYTE_SIZE + // tau, alpha, and beta in g2
-                                   6 * G1_UNCOMPRESSED_BYTE_SIZE; // (s1, s1*tau), (s2, s2*alpha), (s3, s3*beta) in g1
-
-/// The size of the contribution on disk.
-pub const CONTRIBUTION_BYTE_SIZE: usize = (TAU_POWERS_G1_LENGTH * G1_COMPRESSED_BYTE_SIZE) + // g1 tau powers
-                                          (TAU_POWERS_LENGTH * G2_COMPRESSED_BYTE_SIZE) + // g2 tau powers
-                                          (TAU_POWERS_LENGTH * G1_COMPRESSED_BYTE_SIZE) + // alpha tau powers
-                                          (TAU_POWERS_LENGTH * G1_COMPRESSED_BYTE_SIZE) // beta tau powers
-                                          + G2_COMPRESSED_BYTE_SIZE // beta in g2
-                                          + 64 // blake2b hash of input accumulator
-                                          + PUBLIC_KEY_SIZE; // public key
+pub mod configuration;
+pub mod cmd_utils;
+use configuration::*;
 
 /// Hashes to G2 using the first 32 bytes of `digest`. Panics if `digest` is less
 /// than 32 bytes.
@@ -90,13 +64,13 @@ fn hash_to_g2(mut digest: &[u8]) -> G2
 {
     assert!(digest.len() >= 32);
 
-    let mut seed = Vec::with_capacity(8);
-
-    for _ in 0..8 {
-        seed.push(digest.read_u32::<BigEndian>().expect("assertion above guarantees this to work"));
+    let mut seed : [u8;32] = [0;32];
+    for i in 0..8 {
+        let bytes = digest.read_u32::<BigEndian>().unwrap().to_be_bytes();
+        seed[(4 * i) .. ((4 * i) + 4)].copy_from_slice(&bytes);
     }
 
-    ChaChaRng::from_seed(&seed).gen()
+    G2::random(&mut ChaChaRng::from_seed(seed))
 }
 
 #[test]
@@ -123,12 +97,12 @@ fn test_hash_to_g2() {
 /// It is necessary to verify `same_ratio`((s<sub>1</sub>, s<sub>1</sub><sup>x</sup>), (H(s<sub>1</sub><sup>x</sup>)<sub>2</sub>, H(s<sub>1</sub><sup>x</sup>)<sub>2</sub><sup>x</sup>)).
 #[derive(PartialEq, Eq)]
 pub struct PublicKey {
-    tau_g1: (G1Affine, G1Affine),
-    alpha_g1: (G1Affine, G1Affine),
-    beta_g1: (G1Affine, G1Affine),
-    tau_g2: G2Affine,
-    alpha_g2: G2Affine,
-    beta_g2: G2Affine
+    tau_g1: (G1, G1),
+    alpha_g1: (G1, G1),
+    beta_g1: (G1, G1),
+    tau_g2: G2,
+    alpha_g2: G2,
+    beta_g2: G2
 }
 
 /// Contains the secrets τ, α and β that the participant of the ceremony must destroy.
@@ -138,33 +112,46 @@ pub struct PrivateKey {
     beta: Fr
 }
 
+fn compute_g2_s(
+    g1_s: &G1,
+    g1_s_x: &G1,
+    personalization: u8,
+    transcript_digest: &[u8]) -> G2
+{
+    let g1_s_enc = bincode::encode(&g1_s, INF)
+        .expect("g1_s encoding");
+    let g1_s_x_enc = bincode::encode(&g1_s_x, INF)
+        .expect("g1_s_x encoding");
+
+    // Compute BLAKE2b(personalization | transcript | g^s | g^{s*x})
+    let mut h = Blake2b::default();
+    h.input(&[personalization]);
+    h.input(transcript_digest);
+    h.input(g1_s_enc.as_ref());
+    h.input(g1_s_x_enc.as_ref());
+
+    // Hash into G2 as g^{s'}
+    hash_to_g2(&h.result())
+}
+
 /// Constructs a keypair given an RNG and a 64-byte transcript `digest`.
 pub fn keypair<R: Rng>(rng: &mut R, digest: &[u8]) -> (PublicKey, PrivateKey)
 {
     assert_eq!(digest.len(), 64);
 
-    let tau = Fr::rand(rng);
-    let alpha = Fr::rand(rng);
-    let beta = Fr::rand(rng);
+    let tau = Fr::random(rng);
+    let alpha = Fr::random(rng);
+    let beta = Fr::random(rng);
 
     let mut op = |x, personalization: u8| {
         // Sample random g^s
-        let g1_s = G1::rand(rng).into_affine();
+        let g1_s = G1::random(rng);
         // Compute g^{s*x}
-        let g1_s_x = g1_s.mul(x).into_affine();
-        // Compute BLAKE2b(personalization | transcript | g^s | g^{s*x})
-        let h = {
-            let mut h = Blake2b::default();
-            h.input(&[personalization]);
-            h.input(digest);
-            h.input(g1_s.into_uncompressed().as_ref());
-            h.input(g1_s_x.into_uncompressed().as_ref());
-            h.result()
-        };
-        // Hash into G2 as g^{s'}
-        let g2_s = hash_to_g2(h.as_ref()).into_affine();
+        let g1_s_x = g1_s.mul(x);
+        // Compute hash in G2
+        let g2_s = compute_g2_s(&g1_s, &g1_s_x, personalization, digest);
         // Compute g^{s'*x}
-        let g2_s_x = g2_s.mul(x).into_affine();
+        let g2_s_x = g2_s.mul(x);
 
         ((g1_s, g1_s_x), g2_s_x)
     };
@@ -212,11 +199,21 @@ fn write_point<W, G>(
     compression: UseCompression
 ) -> io::Result<()>
     where W: Write,
-          G: CurveAffine
+          G: Group,
+          G: Encodable,
+          G::Compressed: Encodable,
 {
-    match compression {
-        UseCompression::Yes => writer.write_all(p.into_compressed().as_ref()),
-        UseCompression::No => writer.write_all(p.into_uncompressed().as_ref()),
+    let result = match compression {
+        UseCompression::No =>
+            bincode::encode_into(p, writer, INF),
+        UseCompression::Yes =>
+            bincode::encode_into(&p.as_compressed(), writer, INF),
+    };
+
+    match result {
+        Err(EncodingError::IoError(io_err)) => Err(io_err),
+        Err(EncodingError::SizeLimit) => Err(io::ErrorKind::Other)?,
+        Ok(()) => Ok(()),
     }
 }
 
@@ -224,7 +221,8 @@ fn write_point<W, G>(
 #[derive(Debug)]
 pub enum DeserializationError {
     IoError(io::Error),
-    DecodingError(GroupDecodingError),
+    DecodingError(DecodingError),
+    CurveError(CurveError),
     PointAtInfinity
 }
 
@@ -233,6 +231,7 @@ impl fmt::Display for DeserializationError {
         match *self {
             DeserializationError::IoError(ref e) => write!(f, "Disk IO error: {}", e),
             DeserializationError::DecodingError(ref e) => write!(f, "Decoding error: {}", e),
+            DeserializationError::CurveError(ref e) => write!(f, "Curve error: {:?}", e),
             DeserializationError::PointAtInfinity => write!(f, "Point at infinity found")
         }
     }
@@ -244,8 +243,14 @@ impl From<io::Error> for DeserializationError {
     }
 }
 
-impl From<GroupDecodingError> for DeserializationError {
-    fn from(err: GroupDecodingError) -> DeserializationError {
+impl From<CurveError> for DeserializationError {
+    fn from(err: CurveError) -> DeserializationError {
+        DeserializationError::CurveError(err)
+    }
+}
+
+impl From<DecodingError> for DeserializationError {
+    fn from(err: DecodingError) -> DeserializationError {
         DeserializationError::DecodingError(err)
     }
 }
@@ -275,10 +280,8 @@ impl PublicKey {
     /// points at infinity.
     pub fn deserialize<R: Read>(reader: &mut R) -> Result<PublicKey, DeserializationError>
     {
-        fn read_uncompressed<C: CurveAffine, R: Read>(reader: &mut R) -> Result<C, DeserializationError> {
-            let mut repr = C::Uncompressed::empty();
-            reader.read_exact(repr.as_mut())?;
-            let v = repr.into_affine()?;
+        fn read_uncompressed<C: Group + Decodable, R: Read>(reader: &mut R) -> Result<C, DeserializationError> {
+            let v : C = bincode::decode_from(reader, INF)?;
 
             if v.is_zero() {
                 Err(DeserializationError::PointAtInfinity)
@@ -335,26 +338,28 @@ fn test_pubkey_serialization() {
 #[derive(PartialEq, Eq, Clone)]
 pub struct Accumulator {
     /// tau^0, tau^1, tau^2, ..., tau^{TAU_POWERS_G1_LENGTH - 1}
-    pub tau_powers_g1: Vec<G1Affine>,
+    pub tau_powers_g1: Vec<G1>,
     /// tau^0, tau^1, tau^2, ..., tau^{TAU_POWERS_LENGTH - 1}
-    pub tau_powers_g2: Vec<G2Affine>,
+    pub tau_powers_g2: Vec<G2>,
     /// alpha * tau^0, alpha * tau^1, alpha * tau^2, ..., alpha * tau^{TAU_POWERS_LENGTH - 1}
-    pub alpha_tau_powers_g1: Vec<G1Affine>,
+    pub alpha_tau_powers_g1: Vec<G1>,
     /// beta * tau^0, beta * tau^1, beta * tau^2, ..., beta * tau^{TAU_POWERS_LENGTH - 1}
-    pub beta_tau_powers_g1: Vec<G1Affine>,
+    pub beta_tau_powers_g1: Vec<G1>,
     /// beta
-    pub beta_g2: G2Affine
+    pub beta_g2: G2,
+    pub config: Configuration,
 }
 
 impl Accumulator {
     /// Constructs an "initial" accumulator with τ = 1, α = 1, β = 1.
-    pub fn new() -> Self {
+    pub fn new(config: Configuration) -> Self {
         Accumulator {
-            tau_powers_g1: vec![G1Affine::one(); TAU_POWERS_G1_LENGTH],
-            tau_powers_g2: vec![G2Affine::one(); TAU_POWERS_LENGTH],
-            alpha_tau_powers_g1: vec![G1Affine::one(); TAU_POWERS_LENGTH],
-            beta_tau_powers_g1: vec![G1Affine::one(); TAU_POWERS_LENGTH],
-            beta_g2: G2Affine::one()
+            tau_powers_g1: vec![G1::one(); config.num_powers_g1],
+            tau_powers_g2: vec![G2::one(); config.num_powers],
+            alpha_tau_powers_g1: vec![G1::one(); config.num_powers],
+            beta_tau_powers_g1: vec![G1::one(); config.num_powers],
+            beta_g2: G2::one(),
+            config: config,
         }
     }
 
@@ -365,11 +370,12 @@ impl Accumulator {
         compression: UseCompression
     ) -> io::Result<()>
     {
-        fn write_all<W: Write, C: CurveAffine>(
+        fn write_all<W: Write, C: Group + Encodable>(
             writer: &mut W,
             c: &[C],
-            compression: UseCompression
-        ) -> io::Result<()>
+            compression: UseCompression)
+            -> io::Result<()>
+            where C::Compressed: Encodable
         {
             for c in c {
                 write_point(writer, c, compression)?;
@@ -391,102 +397,61 @@ impl Accumulator {
     /// indicates whether we should check it's a valid element of the group and
     /// not the point at infinity.
     pub fn deserialize<R: Read>(
+        config: Configuration,
         reader: &mut R,
         compression: UseCompression,
         checked: CheckForCorrectness
     ) -> Result<Self, DeserializationError>
     {
-        fn read_all<R: Read, C: CurveAffine>(
+        fn read_all<R: Read, C: Group + Decodable>(
             reader: &mut R,
             size: usize,
             compression: UseCompression,
             checked: CheckForCorrectness
         ) -> Result<Vec<C>, DeserializationError>
+        where C::Compressed : Decodable
         {
-            fn decompress_all<R: Read, E: EncodedPoint>(
+            fn decompress_all<R: Read, C: Group + Decodable>(
                 reader: &mut R,
                 size: usize,
-                checked: CheckForCorrectness
-            ) -> Result<Vec<E::Affine>, DeserializationError>
+                compression: UseCompression,
+                _checked: CheckForCorrectness
+            ) -> Result<Vec<C>, DeserializationError>
+                where C::Compressed : Decodable
             {
                 // Read the encoded elements
-                let mut res = vec![E::empty(); size];
+                let mut elements = vec![C::zero(); size];
 
-                for encoded in &mut res {
-                    reader.read_exact(encoded.as_mut())?;
-                }
-
-                // Allocate space for the deserialized elements
-                let mut res_affine = vec![E::Affine::zero(); size];
-
-                let mut chunk_size = res.len() / num_cpus::get();
-                if chunk_size == 0 {
-                    chunk_size = 1;
-                }
-
-                // If any of our threads encounter a deserialization/IO error, catch
-                // it with this.
-                let decoding_error = Arc::new(Mutex::new(None));
-
-                crossbeam::scope(|scope| {
-                    for (source, target) in res.chunks(chunk_size).zip(res_affine.chunks_mut(chunk_size)) {
-                        let decoding_error = decoding_error.clone();
-
-                        scope.spawn(move || {
-                            for (source, target) in source.iter().zip(target.iter_mut()) {
-                                match {
-                                    // If we're a participant, we don't need to check all of the
-                                    // elements in the accumulator, which saves a lot of time.
-                                    // The hash chain prevents this from being a problem: the
-                                    // transcript guarantees that the accumulator was properly
-                                    // formed.
-                                    match checked {
-                                        CheckForCorrectness::Yes => {
-                                            // Points at infinity are never expected in the accumulator
-                                            source.into_affine().map_err(|e| e.into()).and_then(|source| {
-                                                if source.is_zero() {
-                                                    Err(DeserializationError::PointAtInfinity)
-                                                } else {
-                                                    Ok(source)
-                                                }
-                                            })
-                                        },
-                                        CheckForCorrectness::No => source.into_affine_unchecked().map_err(|e| e.into())
-                                    }
-                                }
-                                {
-                                    Ok(source) => {
-                                        *target = source;
-                                    },
-                                    Err(e) => {
-                                        *decoding_error.lock().unwrap() = Some(e);
-                                    }
-                                }
-                            }
-                        });
+                match compression {
+                    UseCompression::No => {
+                        for element in &mut elements {
+                            *element = bincode::decode_from(reader, INF)?;
+                        }
                     }
-                });
-
-                match Arc::try_unwrap(decoding_error).unwrap().into_inner().unwrap() {
-                    Some(e) => {
-                        Err(e)
-                    },
-                    None => {
-                        Ok(res_affine)
+                    UseCompression::Yes => {
+                        for element in &mut elements {
+                            let comp : C::Compressed = bincode::decode_from(reader, INF)?;
+                            *element = C::from_compressed(&comp)?
+                        }
                     }
                 }
+
+                // TODO: Support skipping correctness checking
+
+                Ok(elements)
             }
 
-            match compression {
-                UseCompression::Yes => decompress_all::<_, C::Compressed>(reader, size, checked),
-                UseCompression::No => decompress_all::<_, C::Uncompressed>(reader, size, checked)
-            }
+            decompress_all::<_, C>(reader, size, compression, checked)
         }
 
-        let tau_powers_g1 = read_all(reader, TAU_POWERS_G1_LENGTH, compression, checked)?;
-        let tau_powers_g2 = read_all(reader, TAU_POWERS_LENGTH, compression, checked)?;
-        let alpha_tau_powers_g1 = read_all(reader, TAU_POWERS_LENGTH, compression, checked)?;
-        let beta_tau_powers_g1 = read_all(reader, TAU_POWERS_LENGTH, compression, checked)?;
+        let tau_powers_g1 = read_all(
+            reader, config.num_powers_g1, compression, checked)?;
+        let tau_powers_g2 = read_all(
+            reader, config.num_powers, compression, checked)?;
+        let alpha_tau_powers_g1 = read_all(
+            reader, config.num_powers, compression, checked)?;
+        let beta_tau_powers_g1 = read_all(
+            reader, config.num_powers, compression, checked)?;
         let beta_g2 = read_all(reader, 1, compression, checked)?[0];
 
         Ok(Accumulator {
@@ -494,7 +459,8 @@ impl Accumulator {
             tau_powers_g2: tau_powers_g2,
             alpha_tau_powers_g1: alpha_tau_powers_g1,
             beta_tau_powers_g1: beta_tau_powers_g1,
-            beta_g2: beta_g2
+            beta_g2: beta_g2,
+            config: config,
         })
     }
 
@@ -502,75 +468,53 @@ impl Accumulator {
     pub fn transform(&mut self, key: &PrivateKey)
     {
         // Construct the powers of tau
-        let mut taupowers = vec![Fr::zero(); TAU_POWERS_G1_LENGTH];
-        let chunk_size = TAU_POWERS_G1_LENGTH / num_cpus::get();
+        let mut taupowers = vec![Fr::zero(); self.config.num_powers_g1];
+        let chunk_size = self.config.num_powers_g1 / num_cpus::get();
 
-        // Construct exponents in parallel
         crossbeam::scope(|scope| {
             for (i, taupowers) in taupowers.chunks_mut(chunk_size).enumerate() {
                 scope.spawn(move || {
-                    let mut acc = key.tau.pow(&[(i * chunk_size) as u64]);
-
+                    let exp : U256 = U256::from((i * chunk_size) as u64);
+                    let exp = Fr::new(exp).unwrap();
+                    let mut acc = key.tau.pow(exp);
                     for t in taupowers {
                         *t = acc;
-                        acc.mul_assign(&key.tau);
+                        acc = acc * key.tau;
                     }
                 });
             }
         });
 
-        /// Exponentiate a large number of points, with an optional coefficient to be applied to the
-        /// exponent.
-        fn batch_exp<C: CurveAffine>(bases: &mut [C], exp: &[C::Scalar], coeff: Option<&C::Scalar>) {
+        fn batch_exp<C: Group>(bases: &mut [C], exp: &[Fr], coeff: Option<&Fr>)
+        {
             assert_eq!(bases.len(), exp.len());
-            let mut projective = vec![C::Projective::zero(); bases.len()];
             let chunk_size = bases.len() / num_cpus::get();
 
-            // Perform wNAF over multiple cores, placing results into `projective`.
+            // Perform exponentiation over multiple cores.
             crossbeam::scope(|scope| {
-                for ((bases, exp), projective) in bases.chunks_mut(chunk_size)
-                                                       .zip(exp.chunks(chunk_size))
-                                                       .zip(projective.chunks_mut(chunk_size))
+                for (bases, exp) in bases.chunks_mut(chunk_size)
+                    .zip(exp.chunks(chunk_size))
                 {
                     scope.spawn(move || {
-                        let mut wnaf = Wnaf::new();
-
-                        for ((base, exp), projective) in bases.iter_mut()
-                                                              .zip(exp.iter())
-                                                              .zip(projective.iter_mut())
+                        for (base, exp) in bases.iter_mut().zip(exp.iter())
                         {
-                            let mut exp = *exp;
-                            if let Some(coeff) = coeff {
-                                exp.mul_assign(coeff);
-                            }
-
-                            *projective = wnaf.base(base.into_projective(), 1).scalar(exp.into_repr());
+                            let final_exp = {
+                                if let Some(coeff) = coeff { exp.mul(*coeff) }
+                                else { *exp }
+                            };
+                            *base = base.mul(final_exp);
                         }
                     });
                 }
             });
-
-            // Perform batch normalization
-            crossbeam::scope(|scope| {
-                for projective in projective.chunks_mut(chunk_size)
-                {
-                    scope.spawn(move || {
-                        C::Projective::batch_normalization(projective);
-                    });
-                }
-            });
-
-            // Turn it all back into affine points
-            for (projective, affine) in projective.iter().zip(bases.iter_mut()) {
-                *affine = projective.into_affine();
-            }
         }
 
+        let num_powers = self.config.num_powers;
         batch_exp(&mut self.tau_powers_g1, &taupowers[0..], None);
-        batch_exp(&mut self.tau_powers_g2, &taupowers[0..TAU_POWERS_LENGTH], None);
-        batch_exp(&mut self.alpha_tau_powers_g1, &taupowers[0..TAU_POWERS_LENGTH], Some(&key.alpha));
-        batch_exp(&mut self.beta_tau_powers_g1, &taupowers[0..TAU_POWERS_LENGTH], Some(&key.beta));
-        self.beta_g2 = self.beta_g2.mul(key.beta).into_affine();
+        batch_exp(&mut self.tau_powers_g2, &taupowers[0..num_powers], None);
+        batch_exp(&mut self.alpha_tau_powers_g1, &taupowers[0..num_powers], Some(&key.alpha));
+        batch_exp(&mut self.beta_tau_powers_g1, &taupowers[0..num_powers], Some(&key.beta));
+        self.beta_g2 = self.beta_g2.mul(key.beta);
     }
 }
 
@@ -579,18 +523,9 @@ pub fn verify_transform(before: &Accumulator, after: &Accumulator, key: &PublicK
 {
     assert_eq!(digest.len(), 64);
 
-    let compute_g2_s = |g1_s: G1Affine, g1_s_x: G1Affine, personalization: u8| {
-        let mut h = Blake2b::default();
-        h.input(&[personalization]);
-        h.input(digest);
-        h.input(g1_s.into_uncompressed().as_ref());
-        h.input(g1_s_x.into_uncompressed().as_ref());
-        hash_to_g2(h.result().as_ref()).into_affine()
-    };
-
-    let tau_g2_s = compute_g2_s(key.tau_g1.0, key.tau_g1.1, 0);
-    let alpha_g2_s = compute_g2_s(key.alpha_g1.0, key.alpha_g1.1, 1);
-    let beta_g2_s = compute_g2_s(key.beta_g1.0, key.beta_g1.1, 2);
+    let tau_g2_s = compute_g2_s(&key.tau_g1.0, &key.tau_g1.1, 0, digest);
+    let alpha_g2_s = compute_g2_s(&key.alpha_g1.0, &key.alpha_g1.1, 1, digest);
+    let beta_g2_s = compute_g2_s(&key.beta_g1.0, &key.beta_g1.1, 2, digest);
 
     // Check the proofs-of-knowledge for tau/alpha/beta
     if !same_ratio(key.tau_g1, (tau_g2_s, key.tau_g2)) {
@@ -604,10 +539,10 @@ pub fn verify_transform(before: &Accumulator, after: &Accumulator, key: &PublicK
     }
 
     // Check the correctness of the generators for tau powers
-    if after.tau_powers_g1[0] != G1Affine::one() {
+    if after.tau_powers_g1[0] != G1::one() {
         return false;
     }
-    if after.tau_powers_g2[0] != G2Affine::one() {
+    if after.tau_powers_g2[0] != G2::one() {
         return false;
     }
 
@@ -633,7 +568,9 @@ pub fn verify_transform(before: &Accumulator, after: &Accumulator, key: &PublicK
     if !same_ratio(power_pairs(&after.tau_powers_g1), (after.tau_powers_g2[0], after.tau_powers_g2[1])) {
         return false;
     }
-    if !same_ratio(power_pairs(&after.tau_powers_g2), (after.tau_powers_g1[0], after.tau_powers_g1[1])) {
+    if !same_ratio(
+        (after.tau_powers_g1[0], after.tau_powers_g1[1]),
+        power_pairs(&after.tau_powers_g2)) {
         return false;
     }
     if !same_ratio(power_pairs(&after.alpha_tau_powers_g1), (after.tau_powers_g2[0], after.tau_powers_g2[1])) {
@@ -659,17 +596,20 @@ pub fn verify_transform(before: &Accumulator, after: &Accumulator, key: &PublicK
 /// e(g, (as)*r1 + (bs)*r2 + (cs)*r3) = e(g^s, a*r1 + b*r2 + c*r3)
 ///
 /// ... with high probability.
-fn merge_pairs<G: CurveAffine>(v1: &[G], v2: &[G]) -> (G, G)
+fn merge_pairs<G: Group>(v1: &[G], v2: &[G]) -> (G, G)
 {
-    use std::sync::{Arc, Mutex};
     use rand::{thread_rng};
+    use std::sync::{Arc, Mutex};
 
     assert_eq!(v1.len(), v2.len());
 
-    let chunk = (v1.len() / num_cpus::get()) + 1;
+    // TODO: Multi-thread this
 
-    let s = Arc::new(Mutex::new(G::Projective::zero()));
-    let sx = Arc::new(Mutex::new(G::Projective::zero()));
+    // TODO: Use wNAF and multi-threading
+
+    let chunk = (v1.len() / num_cpus::get()) + 1;
+    let s = Arc::new(Mutex::new(G::zero()));
+    let sx = Arc::new(Mutex::new(G::zero()));
 
     crossbeam::scope(|scope| {
         for (v1, v2) in v1.chunks(chunk).zip(v2.chunks(chunk)) {
@@ -681,35 +621,33 @@ fn merge_pairs<G: CurveAffine>(v1: &[G], v2: &[G]) -> (G, G)
                 // used for this check.
                 let rng = &mut thread_rng();
 
-                let mut wnaf = Wnaf::new();
-                let mut local_s = G::Projective::zero();
-                let mut local_sx = G::Projective::zero();
+                let mut local_s = G::zero();
+                let mut local_sx = G::zero();
 
                 for (v1, v2) in v1.iter().zip(v2.iter()) {
-                    let rho = G::Scalar::rand(rng);
-                    let mut wnaf = wnaf.scalar(rho.into_repr());
-                    let v1 = wnaf.base(v1.into_projective());
-                    let v2 = wnaf.base(v2.into_projective());
+                    let rho = Fr::random(rng);
+                    local_s = local_s.add(v1.mul(rho));
+                    local_sx = local_sx.add(v2.mul(rho));
 
-                    local_s.add_assign(&v1);
-                    local_sx.add_assign(&v2);
                 }
 
-                s.lock().unwrap().add_assign(&local_s);
-                sx.lock().unwrap().add_assign(&local_sx);
+                let mut s_ref = s.lock().unwrap();
+                let mut sx_ref = sx.lock().unwrap();
+                *s_ref = (*s_ref).add(local_s);
+                *sx_ref = (*sx_ref).add(local_sx);
             });
         }
     });
 
-    let s = s.lock().unwrap().into_affine();
-    let sx = sx.lock().unwrap().into_affine();
+    let s = s.lock().unwrap();
+    let sx = sx.lock().unwrap();
 
-    (s, sx)
+    (*s, *sx)
 }
 
 /// Construct a single pair (s, s^x) for a vector of
 /// the form [1, x, x^2, x^3, ...].
-fn power_pairs<G: CurveAffine>(v: &[G]) -> (G, G)
+fn power_pairs<G: Group>(v: &[G]) -> (G, G)
 {
     merge_pairs(&v[0..(v.len()-1)], &v[1..])
 }
@@ -721,29 +659,29 @@ fn test_power_pairs() {
     let rng = &mut thread_rng();
 
     let mut v = vec![];
-    let x = Fr::rand(rng);
+    let x = Fr::random(rng);
     let mut acc = Fr::one();
     for _ in 0..100 {
-        v.push(G1Affine::one().mul(acc).into_affine());
-        acc.mul_assign(&x);
+        v.push(G1::one().mul(acc));
+        acc = acc.mul(x);
     }
 
-    let gx = G2Affine::one().mul(x).into_affine();
+    let gx = G2::one().mul(x);
 
-    assert!(same_ratio(power_pairs(&v), (G2Affine::one(), gx)));
+    assert!(same_ratio(power_pairs(&v), (G2::one(), gx)));
 
-    v[1] = v[1].mul(Fr::rand(rng)).into_affine();
+    v[1] = v[1].mul(Fr::random(rng));
 
-    assert!(!same_ratio(power_pairs(&v), (G2Affine::one(), gx)));
+    assert!(!same_ratio(power_pairs(&v), (G2::one(), gx)));
 }
 
 /// Checks if pairs have the same ratio.
-fn same_ratio<G1: CurveAffine>(
+fn same_ratio(
     g1: (G1, G1),
-    g2: (G1::Pair, G1::Pair)
+    g2: (G2, G2)
 ) -> bool
 {
-    g1.0.pairing_with(&g2.1) == g1.1.pairing_with(&g2.0)
+    bn::pairing(g1.0, g2.1) == bn::pairing(g1.1, g2.0)
 }
 
 #[test]
@@ -752,11 +690,11 @@ fn test_same_ratio() {
 
     let rng = &mut thread_rng();
 
-    let s = Fr::rand(rng);
-    let g1 = G1Affine::one();
-    let g2 = G2Affine::one();
-    let g1_s = g1.mul(s).into_affine();
-    let g2_s = g2.mul(s).into_affine();
+    let s = Fr::random(rng);
+    let g1 = G1::one();
+    let g2 = G2::one();
+    let g1_s = g1.mul(s);
+    let g2_s = g2.mul(s);
 
     assert!(same_ratio((g1, g1_s), (g2, g2_s)));
     assert!(!same_ratio((g1_s, g1), (g2, g2_s)));
@@ -766,21 +704,42 @@ fn test_same_ratio() {
 fn test_accumulator_serialization() {
     use rand::thread_rng;
 
+    let config = Configuration::new(256);
     let rng = &mut thread_rng();
     let mut digest = (0..64).map(|_| rng.gen()).collect::<Vec<_>>();
 
-    let mut acc = Accumulator::new();
+    let mut acc = Accumulator::new(config);
     let before = acc.clone();
     let (pk, sk) = keypair(rng, &digest);
     acc.transform(&sk);
     assert!(verify_transform(&before, &acc, &pk, &digest));
     digest[0] = !digest[0];
     assert!(!verify_transform(&before, &acc, &pk, &digest));
-    let mut v = Vec::with_capacity(ACCUMULATOR_BYTE_SIZE - 64);
-    acc.serialize(&mut v, UseCompression::No).unwrap();
-    assert_eq!(v.len(), ACCUMULATOR_BYTE_SIZE - 64);
-    let deserialized = Accumulator::deserialize(&mut &v[..], UseCompression::No, CheckForCorrectness::No).unwrap();
-    assert!(acc == deserialized);
+
+    {
+        let mut v = Vec::with_capacity(config.accumulator_size_bytes - 64);
+        acc.serialize(&mut v, UseCompression::No).unwrap();
+        assert_eq!(v.len(), config.accumulator_size_bytes - 64);
+        let deserialized = Accumulator::deserialize(
+            config,
+            &mut &v[..],
+            UseCompression::No,
+            CheckForCorrectness::No).unwrap();
+        assert!(acc == deserialized);
+    }
+
+    {
+        let expect_size = config.contribution_size_bytes - 64 - PUBLIC_KEY_SIZE;
+        let mut v = Vec::with_capacity(expect_size);
+        acc.serialize(&mut v, UseCompression::Yes).unwrap();
+        assert_eq!(expect_size, v.len());
+        let deserialized = Accumulator::deserialize(
+            config,
+            &mut &v[..],
+            UseCompression::Yes,
+            CheckForCorrectness::No).unwrap();
+        assert!(acc == deserialized);
+    }
 }
 
 /// Compute BLAKE2b("")
