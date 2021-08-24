@@ -13,10 +13,10 @@ repository = "https://github.com/ebfull/powersoftau"
 rand = { version = "0.5", features = ["i128_support"] }
 crossbeam = "0.3.0"
 num_cpus = "1.7.0"
-blake2 = "0.6.1"
-generic-array = "0.8.3"
+blake2 = "0.9.1"
+generic-array = "0"
 typenum = "1.9.0"
-byteorder = { version = "1.0", features = ["i128"] }
+byteorder = { version = "1", features = ["i128"] }
 hex-literal = "0.1"
 rust-crypto = "0.2"
 bn = { path="depends/bn" }

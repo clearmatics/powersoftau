@@ -35,7 +35,7 @@ fn main() {
             // Gather 1024 bytes of entropy from the system
             for _ in 0..1024 {
                 let r: u8 = system_rng.gen();
-                h.input(&[r]);
+                h.update(&[r]);
             }
 
             // Ask the user to provide some information for additional entropy
@@ -44,8 +44,8 @@ fn main() {
             io::stdin().read_line(&mut user_input).expect("expected to read some random text from the user");
 
             // Hash it all up to make a seed
-            h.input(&user_input.as_bytes());
-            h.result()
+            h.update(&user_input.as_bytes());
+            h.finalize()
         };
 
         let mut digest = &h[..];
