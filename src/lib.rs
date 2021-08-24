@@ -125,13 +125,13 @@ fn compute_g2_s(
 
     // Compute BLAKE2b(personalization | transcript | g^s | g^{s*x})
     let mut h = Blake2b::default();
-    h.input(&[personalization]);
-    h.input(transcript_digest);
-    h.input(g1_s_enc.as_ref());
-    h.input(g1_s_x_enc.as_ref());
+    h.update(&[personalization]);
+    h.update(transcript_digest);
+    h.update(&g1_s_enc);
+    h.update(&g1_s_x_enc);
 
     // Hash into G2 as g^{s'}
-    hash_to_g2(&h.result())
+    hash_to_g2(&h.finalize())
 }
 
 /// Constructs a keypair given an RNG and a 64-byte transcript `digest`.
@@ -744,7 +744,7 @@ fn test_accumulator_serialization() {
 
 /// Compute BLAKE2b("")
 pub fn blank_hash() -> GenericArray<u8, U64> {
-    Blake2b::new().result()
+    Blake2b::new().finalize()
 }
 
 /// Abstraction over a reader which hashes the data being read.
@@ -764,7 +764,7 @@ impl<R: Read> HashReader<R> {
 
     /// Destroy this reader and return the hash of what was read.
     pub fn into_hash(self) -> GenericArray<u8, U64> {
-        self.hasher.result()
+        self.hasher.finalize()
     }
 }
 
@@ -773,7 +773,7 @@ impl<R: Read> Read for HashReader<R> {
         let bytes = self.reader.read(buf)?;
 
         if bytes > 0 {
-            self.hasher.input(&buf[0..bytes]);
+            self.hasher.update(&buf[0..bytes]);
         }
 
         Ok(bytes)
@@ -797,7 +797,7 @@ impl<W: Write> HashWriter<W> {
 
     /// Destroy this writer and return the hash of what was written.
     pub fn into_hash(self) -> GenericArray<u8, U64> {
-        self.hasher.result()
+        self.hasher.finalize()
     }
 }
 
@@ -806,7 +806,7 @@ impl<W: Write> Write for HashWriter<W> {
         let bytes = self.writer.write(buf)?;
 
         if bytes > 0 {
-            self.hasher.input(&buf[0..bytes]);
+            self.hasher.update(&buf[0..bytes]);
         }
 
         Ok(bytes)
